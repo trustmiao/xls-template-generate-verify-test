@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Test outputs
+test/outputs/
+
+# Claude temp files
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
