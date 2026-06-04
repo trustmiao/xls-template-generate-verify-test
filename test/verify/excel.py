@@ -142,6 +142,15 @@ def run_check_date_zone(xlsx_path: Path, sheet: str, month: str) -> Dict[str, An
     return {"ok": True, "days": actual}
 
 
+def run_check_cleaning_summary(xlsx_path: Path, sheet: str, month: str) -> Dict[str, Any]:
+    """Run cleaning-specific checks (issue #4) on a generated xlsx."""
+    try:
+        from .cleaning import run_check_cleaning_summary as _check
+        return _check(xlsx_path, sheet, month)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def find_template_for_combo(project_id: int, category_id: int, month: str) -> Optional[Path]:
     """Look up the roster_shortfall template path for a given combo."""
     try:

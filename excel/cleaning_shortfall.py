@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from copy import copy
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 from openpyxl import Workbook
 
@@ -101,9 +101,10 @@ def _adjust_cleaning_day_columns(ws, days_in_month: int) -> tuple[int, int, int]
     """Adjust day columns in cleaning template to match month days.
 
     Returns (day_end_col, date_row, weekday_row).
-    For months > 28 days, extra columns are inserted after day 28 and
-    merged into a single header.  Summary formulas are updated to include
-    the extra days.
+    For months > 28 days, extra columns are inserted after day 28.
+    Date-row and weekday-row formulas are extended so the chain continues.
+    Summary formulas are updated to include the extra days while keeping
+    the 4th week (days 22-28) range intact.
     """
     date_row = _detect_cleaning_date_row(ws)
     weekday_row = _detect_cleaning_weekday_row(ws, date_row) if date_row else None
@@ -124,30 +125,30 @@ def _adjust_cleaning_day_columns(ws, days_in_month: int) -> tuple[int, int, int]
     # Insert extra columns after the last day column
     insert_at = day_end_col + 1
     insert_cols_with_formulas(ws, insert_at, diff, date_row=date_row, weekday_row=weekday_row)
+    _shift_merged_cols(ws, insert_at, diff)
     new_day_end = day_end_col + diff
 
-    # Merge the new day-column headers (date row + weekday row) into one cell
-    # showing "29+"  (or "29-31" when diff==3)
-    merge_label = f"29-{days_in_month}" if diff > 1 else f"{days_in_month}"
+    # Fix date-row formulas for inserted columns so the date chain continues.
+    # insert_cols_with_formulas copies the formula from the column before the
+    # insertion point, but that produces an incorrect reference (e.g. copying
+    # AE7=AD7+1 to AF7 still yields AD7+1 instead of AE7+1).  Overwrite with
+    # the correct chained formula.
     if date_row:
-        # Unmerge any existing merged cells in the new header area first
-        from openpyxl.worksheet.cell_range import CellRange
-        for mr in list(ws.merged_cells.ranges):
-            if mr.min_row == date_row and mr.min_col >= insert_at:
-                ws.unmerge_cells(str(mr))
-        # Set merged label on date row
-        ws.cell(date_row, insert_at, value=merge_label)
-        ws.merge_cells(start_row=date_row, start_column=insert_at,
-                       end_row=date_row, end_column=new_day_end)
-    if weekday_row:
-        for mr in list(ws.merged_cells.ranges):
-            if mr.min_row == weekday_row and mr.min_col >= insert_at:
-                ws.unmerge_cells(str(mr))
-        ws.cell(weekday_row, insert_at, value="")
-        ws.merge_cells(start_row=weekday_row, start_column=insert_at,
-                       end_row=weekday_row, end_column=new_day_end)
+        for i in range(diff):
+            col = insert_at + i
+            prev_letter = col_num_to_letter(col - 1)
+            ws.cell(date_row, col, value=f"={prev_letter}{date_row}+1")
 
-    # Update summary formulas that reference the old day-end (AE) to new end
+    # Fix weekday-row formulas similarly.
+    if weekday_row:
+        for i in range(diff):
+            col = insert_at + i
+            col_letter = col_num_to_letter(col)
+            ws.cell(weekday_row, col,
+                    value=f'=SUBSTITUTE(TEXT({col_letter}{date_row},"aaa"),"週","")')
+
+    # Update summary formulas that reference the old day-end (AE) to new end,
+    # but keep the 4th-week (days 22-28) range unchanged.
     _update_cleaning_summary_formulas(ws, day_end_col, new_day_end)
 
     return new_day_end, date_row or 7, weekday_row or 9
@@ -156,17 +157,22 @@ def _adjust_cleaning_day_columns(ws, days_in_month: int) -> tuple[int, int, int]
 def _update_cleaning_summary_formulas(ws, old_end_col: int, new_end_col: int) -> None:
     """Update weekly / total summary formulas to include extra day columns.
 
-    Only updates multi-column ranges (e.g. Y12:AE12 -> Y12:AH12);
-    single-column daily summaries like AE10:AE11 are left untouched.
+    Rules:
+      - 4th-week ranges (start_col = Y, days 22-28) are kept unchanged.
+      - Single-col daily summaries (start_col == old_end_col) are untouched.
+      - All other multi-column ranges ending at old_end_col are expanded to
+        new_end_col (e.g. monthly totals D:AE -> D:AH).
     """
     old_end_letter = col_num_to_letter(old_end_col)
     new_end_letter = col_num_to_letter(new_end_col)
+    # For a template whose day columns start at D (col 4), the 4th week
+    # starts at col 4 + 7*3 = 25 -> letter Y.
+    fourth_week_start = col_num_to_letter(DAY_START_COL + 7 * 3)
 
     def _update_formula(v: str) -> str:
         if not isinstance(v, str) or not v.startswith("="):
             return v
         # Pattern: start_col + start_row : old_end_col + end_row
-        # Only update when start_col != old_end_letter (multi-col range)
         pat = re.compile(rf'([A-Z]+)(\d+):{old_end_letter}(\d+)')
 
         def repl(m: re.Match) -> str:
@@ -174,7 +180,10 @@ def _update_cleaning_summary_formulas(ws, old_end_col: int, new_end_col: int) ->
             start_row = m.group(2)
             end_row = m.group(3)
             if start_col == old_end_letter:
-                # Single-col range (daily summary) — leave untouched
+                # Single-col range — leave untouched
+                return m.group(0)
+            if start_col == fourth_week_start:
+                # 4th week covers days 22-28 — keep the original range
                 return m.group(0)
             return f"{start_col}{start_row}:{new_end_letter}{end_row}"
 
@@ -216,6 +225,29 @@ def _shift_merged_ranges_around_insert(ws, insert_at: int, amount: int) -> None:
             continue
         affected.append((str(mr), str(new)))
     return affected
+
+
+def _shift_merged_cols(ws, insert_at: int, amount: int) -> None:
+    """Shift merged cell ranges that are at or after a column insertion point."""
+    from openpyxl.worksheet.cell_range import CellRange
+    affected: List[Tuple[str, str]] = []
+    for mr in list(ws.merged_cells.ranges):
+        if mr.min_col >= insert_at:
+            new = CellRange(
+                min_col=mr.min_col + amount, min_row=mr.min_row,
+                max_col=mr.max_col + amount, max_row=mr.max_row,
+            )
+            affected.append((str(mr), str(new)))
+        elif mr.max_col >= insert_at:
+            new = CellRange(
+                min_col=mr.min_col, min_row=mr.min_row,
+                max_col=mr.max_col + amount, max_row=mr.max_row,
+            )
+            affected.append((str(mr), str(new)))
+    for old, _ in affected:
+        ws.unmerge_cells(old)
+    for _, new in affected:
+        ws.merge_cells(new)
 
 
 def _shift_merged_ranges(ws, insert_at: int, amount: int) -> None:
@@ -379,6 +411,66 @@ def _fill_data_row(ws, r: int, row_data: Dict[str, Any], days_in_month: int) -> 
             ws.cell(r, col, value=str(v) if v else "")
 
 
+def _add_fifth_week_formulas(ws, day_end_col: int, days_in_month: int) -> None:
+    """Add 5th-week formulas and merge cells for months with >28 days.
+
+    For each section (清潔科文 / 清潔工人 / VO清潔工人) adds:
+      - 5th-week actual hours: SUM(daily-total row for days 29+)
+      - 5th-week required hours: first-week value / 7 * extra_days
+      - 5th-week diff: actual - required
+    All placed in col AF (32) merged across the extra day columns.
+    """
+    if days_in_month <= 28:
+        return
+
+    extra_days = days_in_month - 28
+    first_extra_col = DAY_START_COL + 28          # col 32 = AF
+    first_extra_letter = col_num_to_letter(first_extra_col)
+    new_end_letter = col_num_to_letter(day_end_col)
+    first_col_letter = col_num_to_letter(DAY_START_COL)
+
+    # Map labels to rows
+    stat_rows: Dict[str, int] = {}
+    for r in range(1, ws.max_row + 1):
+        label = ws.cell(r, 2).value
+        if label and isinstance(label, str):
+            stat_rows[label.strip()] = r
+
+    sections = [
+        ("清潔科文(實際) 每週工作總時數", "清潔科文每週所需工作總時數", "欠/多 清潔科文時數"),
+        ("清潔工人(實際)每週工作總時數", "清潔工人每週所需工作總時數", "欠/多 清潔工人時數"),
+        ("VO清潔工人(實際) 每週工作總時數", "VO清潔工人每週所需工作總時數", "欠/多 VO清潔工人時數"),
+    ]
+
+    for actual_label, required_label, diff_label in sections:
+        actual_row = stat_rows.get(actual_label)
+        required_row = stat_rows.get(required_label)
+        diff_row = stat_rows.get(diff_label)
+
+        if not all([actual_row, required_row, diff_row]):
+            continue
+
+        daily_row = actual_row - 1
+
+        # 5th week actual hours
+        ws.cell(actual_row, first_extra_col,
+                value=f"=SUM({first_extra_letter}{daily_row}:{new_end_letter}{daily_row})")
+        ws.merge_cells(start_row=actual_row, start_column=first_extra_col,
+                       end_row=actual_row, end_column=day_end_col)
+
+        # 5th week required hours (proportional)
+        ws.cell(required_row, first_extra_col,
+                value=f"={first_col_letter}{required_row}/7*{extra_days}")
+        ws.merge_cells(start_row=required_row, start_column=first_extra_col,
+                       end_row=required_row, end_column=day_end_col)
+
+        # 5th week diff
+        ws.cell(diff_row, first_extra_col,
+                value=f"={first_extra_letter}{actual_row}-{first_extra_letter}{required_row}")
+        ws.merge_cells(start_row=diff_row, start_column=first_extra_col,
+                       end_row=diff_row, end_column=day_end_col)
+
+
 def run(wb: Workbook, context: Dict[str, Any]) -> None:
     """Fill the 保洁 Roster Shortfall single-sheet template."""
     project_id = context["project_id"]
@@ -442,3 +534,6 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
             _copy_row_formulas(ws, template_data_row, insert_at, n - 1)
         for idx, row_data in enumerate(rows):
             _fill_data_row(ws, template_data_row + idx, row_data, days_in_month)
+
+    # Add 5th-week formulas for months with >28 days
+    _add_fifth_week_formulas(ws, day_end_col, days_in_month)

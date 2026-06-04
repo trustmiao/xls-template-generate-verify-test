@@ -216,6 +216,21 @@ def _run_excel_verify(xlsx_path, template_path, combo, shift, sheet, out_csv=Non
             for line in err.strip().splitlines()[:3]:
                 print(f"      {line}")
     results["compare_template"] = ct
+
+    # Cleaning-specific checks (issue #4)
+    if combo.get("category_id") == 2:
+        print(f"    cleaning summary check ...", end=" ", flush=True)
+        cs = excel_verify.run_check_cleaning_summary(xlsx_path, sheet, combo["month"])
+        if cs.get("ok"):
+            print(f"OK ({cs.get('days')} days, {cs.get('weeks')} weeks)")
+        else:
+            err = cs.get("error", "unknown")
+            print(f"FAIL: {err}")
+            for e in cs.get("errors", []):
+                print(f"      {e}")
+            results["ok"] = False
+        results["cleaning_summary"] = cs
+
     return results
 
 
