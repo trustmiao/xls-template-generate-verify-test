@@ -243,10 +243,11 @@ def run_check_cleaning_summary(xlsx_path: Path, sheet: str, month: str) -> Dict[
             # Template v2 uses =Y{row}/7*COUNT(AF{day}:AH{day}) instead of hard-coded days
             first_col = _col_letter(DAY_START_COL)
             fifth_col_let = _col_letter(fifth_start)
+            fifth_end_let = _col_letter(fifth_end)
             expected_patterns = [
                 f"={first_col}{required_row}/7*{extra_days}",
-                f"={fifth_col_let}{required_row}/7*COUNT({fifth_col_let}{daily_row}:AH{daily_row})",
-                f"=Y{required_row}/7*COUNT({fifth_col_let}{daily_row}:AH{daily_row})",
+                f"={fifth_col_let}{required_row}/7*COUNT({fifth_col_let}{daily_row}:{fifth_end_let}{daily_row})",
+                f"=Y{required_row}/7*COUNT({fifth_col_let}{daily_row}:{fifth_end_let}{daily_row})",
             ]
             fifth_required = ws.cell(required_row, fifth_start).value
             if fifth_required not in expected_patterns:

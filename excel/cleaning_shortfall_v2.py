@@ -35,10 +35,15 @@ _RANGE_RE = re.compile(r"([A-Z$]+)(\d+):\1(\d+)")
 # Merged-cell helpers
 # ---------------------------------------------------------------------------
 
-def _shift_merged_cols_for_delete(ws, delete_from: int, delete_count: int) -> None:
-    """Adjust merged cell ranges after column deletion."""
+def _shift_merged_cols_for_delete(ws, delete_from: int, delete_count: int) -> List[Tuple[str, Optional[str], Any, Any, bool]]:
+    """Adjust merged cell ranges after column deletion.
+
+    Returns a list of (old_range, new_range, tl_value, tl_style, tl_has_style)
+    tuples so the caller can restore top-left cell values AFTER delete_cols
+    (otherwise openpyxl wipes the restored cell during column deletion).
+    """
     from openpyxl.worksheet.cell_range import CellRange
-    affected: List[Tuple[str, Optional[str]]] = []
+    affected: List[Tuple[str, Optional[str], Any, Any, bool]] = []
     delete_end = delete_from + delete_count - 1
 
     for mr in list(ws.merged_cells.ranges):
@@ -49,9 +54,11 @@ def _shift_merged_cols_for_delete(ws, delete_from: int, delete_count: int) -> No
                 min_col=mr.min_col - delete_count, min_row=mr.min_row,
                 max_col=mr.max_col - delete_count, max_row=mr.max_row,
             )
-            affected.append((str(mr), str(new)))
+            # Snapshot top-left value + style before unmerge wipes it
+            tl = ws.cell(mr.min_row, mr.min_col)
+            affected.append((str(mr), str(new), tl.value, tl._style, tl.has_style))
         elif mr.min_col >= delete_from and mr.max_col <= delete_end:
-            affected.append((str(mr), None))
+            affected.append((str(mr), None, None, None, False))
         else:
             if mr.min_col < delete_from:
                 new_max = mr.max_col - delete_count
@@ -70,12 +77,20 @@ def _shift_merged_cols_for_delete(ws, delete_from: int, delete_count: int) -> No
                     min_col=new_min, min_row=mr.min_row,
                     max_col=new_max, max_row=mr.max_row,
                 )
-            affected.append((str(mr), str(new)))
+            # For partially-overlapping ranges the top-left stays the same,
+            # so no need to copy value/style.
+            affected.append((str(mr), str(new), None, None, False))
 
-    for old, new in affected:
+    # Phase 1: unmerge all old ranges first.
+    for old, new, tl_value, tl_style, tl_has_style in affected:
         ws.unmerge_cells(old)
+
+    # Phase 2: merge new ranges.
+    for old, new, tl_value, tl_style, tl_has_style in affected:
         if new:
             ws.merge_cells(new)
+
+    return affected
 
 
 # ---------------------------------------------------------------------------
@@ -102,14 +117,35 @@ def _adjust_day_columns(ws, days_in_month: int) -> int:
             if not isinstance(cell, MergedCell):
                 cell.value = None
 
-    # Adjust merged cells before deleting
-    _shift_merged_cols_for_delete(ws, delete_from, diff)
+    # Adjust merged cells before deleting (returns info needed for post-delete restore)
+    affected = _shift_merged_cols_for_delete(ws, delete_from, diff)
 
     # Update formulas to shrink ranges ending in deleted columns
     update_all_formulas_for_col_change(ws, delete_from, -diff, is_delete=True)
 
     # Delete the excess columns
     ws.delete_cols(delete_from, diff)
+
+    # Restore top-left values for merged ranges that were shifted left.
+    # Must happen AFTER delete_cols because openpyxl removes the restored
+    # cell when the deleted column is removed.
+    from openpyxl.worksheet.cell_range import CellRange
+    for old, new, tl_value, tl_style, tl_has_style in affected:
+        if new and (tl_has_style or tl_value is not None):
+            new_cr = CellRange(new)
+            key = (new_cr.min_row, new_cr.min_col)
+            if key in ws._cells and type(ws._cells[key]).__name__ == "MergedCell":
+                del ws._cells[key]
+            new_tl = ws.cell(new_cr.min_row, new_cr.min_col)
+            if tl_value is not None:
+                # Formulas captured before delete_cols still reference the old
+                # column letters; shift them to match the post-delete layout.
+                if isinstance(tl_value, str) and tl_value.startswith("="):
+                    from ..common.col_adjust import shift_formula_cols
+                    tl_value = shift_formula_cols(tl_value, delete_from, -diff, is_delete=True)
+                new_tl.value = tl_value
+            if tl_has_style and tl_style is not None:
+                new_tl._style = tl_style
 
     return DAY_START_COL + days_in_month - 1
 
