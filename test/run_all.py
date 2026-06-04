@@ -160,6 +160,15 @@ def _run_excel_verify(xlsx_path, template_path, combo, shift, sheet, out_csv=Non
         print(f"FAIL: {dr.get('error', 'unknown')}")
     results["detect_regions"] = dr
 
+    print(f"    excel-verify check_date_zone ...", end=" ", flush=True)
+    dzr = excel_verify.run_check_date_zone(xlsx_path, sheet, combo["month"])
+    if dzr.get("ok"):
+        print(f"OK ({dzr.get('days', '?')} days)")
+    else:
+        err = dzr.get("error", "unknown")
+        print(f"FAIL: {err}")
+    results["check_date_zone"] = dzr
+
     print(f"    excel-verify check_roster_filled ...", end=" ", flush=True)
     cr = excel_verify.run_check_roster_filled(
         xlsx_path=xlsx_path, template_path=template_path, sheet=sheet,

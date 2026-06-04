@@ -1,6 +1,7 @@
 """Excel verify wrapper — calls excel-verify skill scripts."""
 from __future__ import annotations
 
+import calendar
 import json
 import subprocess
 import sys
@@ -108,6 +109,37 @@ def run_compare_template(
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def run_check_date_zone(xlsx_path: Path, sheet: str, month: str) -> Dict[str, Any]:
+    """Check date zone column count matches target month days."""
+    dr = run_detect_regions(xlsx_path, sheet)
+    if not dr.get("ok"):
+        return {"ok": False, "error": dr.get("error", "detect_regions failed")}
+
+    dz = dr.get("date_zone", {})
+    date_row = dz.get("date_row")
+    col_start = dz.get("col_start")
+    col_end = dz.get("col_end")
+
+    if not date_row or col_start is None or col_end is None:
+        return {"ok": True, "note": "no date_zone detected, skip"}
+
+    try:
+        expected = calendar.monthrange(int(month[:4]), int(month[5:7]))[1]
+    except Exception as e:
+        return {"ok": False, "error": f"invalid month {month}: {e}"}
+
+    actual = col_end - col_start + 1
+    if actual != expected:
+        return {
+            "ok": False,
+            "error": f"date zone has {actual} day columns, expected {expected} for {month}",
+            "expected": expected,
+            "actual": actual,
+        }
+
+    return {"ok": True, "days": actual}
 
 
 def find_template_for_combo(project_id: int, category_id: int, month: str) -> Optional[Path]:
