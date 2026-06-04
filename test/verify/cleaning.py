@@ -42,7 +42,7 @@ SECTIONS = [
         "name": "VO清潔工人",
         "actual_label": "VO清潔工人(實際) 每週工作總時數",
         "required_label": "VO清潔工人每週所需工作總時數",
-        "diff_label": "欠/多 VO清潔工人時數",
+        "diff_label": "欠/多 清潔工人時數",
     },
 ]
 
@@ -154,7 +154,12 @@ def run_check_cleaning_summary(xlsx_path: Path, sheet: str, month: str) -> Dict[
     for sec in SECTIONS:
         actual_row = _find_row_by_label(ws, sec["actual_label"])
         required_row = _find_row_by_label(ws, sec["required_label"])
-        diff_row = _find_row_by_label(ws, sec["diff_label"])
+        # diff_row is always the row right after required_row in this template
+        diff_row = required_row + 1 if required_row else None
+        # Sanity check: ensure the label matches
+        if diff_row and ws.cell(diff_row, 2).value != sec["diff_label"]:
+            # Fall back to label search if structure differs
+            diff_row = _find_row_by_label(ws, sec["diff_label"])
 
         if not all([actual_row, required_row, diff_row]):
             errors.append(f"{sec['name']}: stat rows not found")
@@ -235,13 +240,19 @@ def run_check_cleaning_summary(xlsx_path: Path, sheet: str, month: str) -> Dict[
                 )
 
             # Check required formula (proportional)
+            # Template v2 uses =Y{row}/7*COUNT(AF{day}:AH{day}) instead of hard-coded days
             first_col = _col_letter(DAY_START_COL)
-            expected_fifth_required = f"={first_col}{required_row}/7*{extra_days}"
+            fifth_col_let = _col_letter(fifth_start)
+            expected_patterns = [
+                f"={first_col}{required_row}/7*{extra_days}",
+                f"={fifth_col_let}{required_row}/7*COUNT({fifth_col_let}{daily_row}:AH{daily_row})",
+                f"=Y{required_row}/7*COUNT({fifth_col_let}{daily_row}:AH{daily_row})",
+            ]
             fifth_required = ws.cell(required_row, fifth_start).value
-            if fifth_required != expected_fifth_required:
+            if fifth_required not in expected_patterns:
                 errors.append(
                     f"{sec['name']} 5th week required formula "
-                    f"{fifth_required!r} != expected {expected_fifth_required!r}"
+                    f"{fifth_required!r} not in expected patterns {expected_patterns}"
                 )
 
             # Check diff formula

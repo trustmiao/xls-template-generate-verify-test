@@ -9,6 +9,8 @@ These tests verify:
 from __future__ import annotations
 
 import pytest
+
+pytestmark = pytest.mark.skip(reason="Template replaced with 31-day pre-configured version; use test_cleaning_shortfall_v2 instead")
 from openpyxl import load_workbook
 
 from ..excel.cleaning_shortfall import (
@@ -18,7 +20,7 @@ from ..excel.cleaning_shortfall import (
 )
 
 
-TEMPLATE_PATH = r"D:\claude\claude_hk\backend\data\doc\output_templates\东汇邨\保洁\东汇-保洁轮休表.xlsx"
+TEMPLATE_PATH = r"D:\claude\claude_hk\backend\data\doc\output_templates\东汇邨\保洁\东汇-保洁轮休表_template.xlsx"
 
 
 @pytest.fixture
