@@ -18,6 +18,14 @@ from typing import Any, Dict
 
 from openpyxl import Workbook
 
+from ..common.col_adjust import (
+    shift_formula_cols,
+    delete_cols_with_formulas,
+    insert_cols_with_formulas,
+    col_letter_to_num,
+    col_num_to_letter,
+)
+
 DAY_START_COL = 4  # col D
 RANK_COL = 2       # col B
 NAME_COL = 3       # col C
@@ -49,6 +57,136 @@ def _find_data_row(ws, start_row: int, end_row: int) -> int | None:
             if m and m.group(2) == m.group(3):
                 return int(m.group(2))
     return None
+
+
+# ---------------------------------------------------------------------------
+# Day-column detection / adjustment for cleaning templates
+# ---------------------------------------------------------------------------
+
+def _detect_cleaning_date_row(ws) -> int | None:
+    """Find the row containing the first date value (e.g. 2026-02-01)."""
+    for r in range(1, min(ws.max_row, 15) + 1):
+        for c in range(DAY_START_COL, min(ws.max_column + 1, DAY_START_COL + 35)):
+            v = ws.cell(r, c).value
+            if v is not None and hasattr(v, "year"):
+                return r
+    return None
+
+
+def _detect_cleaning_weekday_row(ws, date_row: int) -> int | None:
+    """Find the weekday row right below the date row."""
+    for r in range(date_row + 1, min(ws.max_row, date_row + 5) + 1):
+        v = ws.cell(r, DAY_START_COL).value
+        if v is not None:
+            return r
+    return None
+
+
+def _detect_day_end_col(ws, date_row: int) -> int:
+    """Detect the last day column by walking the date row."""
+    last_day = None
+    for c in range(DAY_START_COL, ws.max_column + 1):
+        v = ws.cell(date_row, c).value
+        if v is not None and hasattr(v, "year"):
+            last_day = c
+        elif isinstance(v, str) and v.startswith("=") and "+1" in v:
+            last_day = c
+        elif v is not None and isinstance(v, str) and v.strip() and not v.startswith("="):
+            # Hit a label like "1-7號時數" — this is past the day columns
+            break
+    return last_day or DAY_START_COL + 27
+
+
+def _adjust_cleaning_day_columns(ws, days_in_month: int) -> tuple[int, int, int]:
+    """Adjust day columns in cleaning template to match month days.
+
+    Returns (day_end_col, date_row, weekday_row).
+    For months > 28 days, extra columns are inserted after day 28 and
+    merged into a single header.  Summary formulas are updated to include
+    the extra days.
+    """
+    date_row = _detect_cleaning_date_row(ws)
+    weekday_row = _detect_cleaning_weekday_row(ws, date_row) if date_row else None
+    day_end_col = _detect_day_end_col(ws, date_row) if date_row else DAY_START_COL + 27
+    tpl_days = day_end_col - DAY_START_COL + 1
+    diff = days_in_month - tpl_days
+
+    if diff == 0:
+        return day_end_col, date_row or 7, weekday_row or 9
+
+    if diff < 0:
+        # Delete excess columns
+        delete_from = DAY_START_COL + days_in_month
+        delete_cols_with_formulas(ws, delete_from, -diff)
+        day_end_col = DAY_START_COL + days_in_month - 1
+        return day_end_col, date_row or 7, weekday_row or 9
+
+    # Insert extra columns after the last day column
+    insert_at = day_end_col + 1
+    insert_cols_with_formulas(ws, insert_at, diff, date_row=date_row, weekday_row=weekday_row)
+    new_day_end = day_end_col + diff
+
+    # Merge the new day-column headers (date row + weekday row) into one cell
+    # showing "29+"  (or "29-31" when diff==3)
+    merge_label = f"29-{days_in_month}" if diff > 1 else f"{days_in_month}"
+    if date_row:
+        # Unmerge any existing merged cells in the new header area first
+        from openpyxl.worksheet.cell_range import CellRange
+        for mr in list(ws.merged_cells.ranges):
+            if mr.min_row == date_row and mr.min_col >= insert_at:
+                ws.unmerge_cells(str(mr))
+        # Set merged label on date row
+        ws.cell(date_row, insert_at, value=merge_label)
+        ws.merge_cells(start_row=date_row, start_column=insert_at,
+                       end_row=date_row, end_column=new_day_end)
+    if weekday_row:
+        for mr in list(ws.merged_cells.ranges):
+            if mr.min_row == weekday_row and mr.min_col >= insert_at:
+                ws.unmerge_cells(str(mr))
+        ws.cell(weekday_row, insert_at, value="")
+        ws.merge_cells(start_row=weekday_row, start_column=insert_at,
+                       end_row=weekday_row, end_column=new_day_end)
+
+    # Update summary formulas that reference the old day-end (AE) to new end
+    _update_cleaning_summary_formulas(ws, day_end_col, new_day_end)
+
+    return new_day_end, date_row or 7, weekday_row or 9
+
+
+def _update_cleaning_summary_formulas(ws, old_end_col: int, new_end_col: int) -> None:
+    """Update weekly / total summary formulas to include extra day columns.
+
+    Only updates multi-column ranges (e.g. Y12:AE12 -> Y12:AH12);
+    single-column daily summaries like AE10:AE11 are left untouched.
+    """
+    old_end_letter = col_num_to_letter(old_end_col)
+    new_end_letter = col_num_to_letter(new_end_col)
+
+    def _update_formula(v: str) -> str:
+        if not isinstance(v, str) or not v.startswith("="):
+            return v
+        # Pattern: start_col + start_row : old_end_col + end_row
+        # Only update when start_col != old_end_letter (multi-col range)
+        pat = re.compile(rf'([A-Z]+)(\d+):{old_end_letter}(\d+)')
+
+        def repl(m: re.Match) -> str:
+            start_col = m.group(1)
+            start_row = m.group(2)
+            end_row = m.group(3)
+            if start_col == old_end_letter:
+                # Single-col range (daily summary) — leave untouched
+                return m.group(0)
+            return f"{start_col}{start_row}:{new_end_letter}{end_row}"
+
+        return pat.sub(repl, v)
+
+    for row in range(1, ws.max_row + 1):
+        for col in range(1, ws.max_column + 1):
+            cell = ws.cell(row, col)
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                new_v = _update_formula(cell.value)
+                if new_v != cell.value:
+                    cell.value = new_v
 
 
 def _shift_merged_ranges_around_insert(ws, insert_at: int, amount: int) -> None:
@@ -259,6 +397,9 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
     days_in_month = data.get("days_in_month", 31)
 
     ws = wb.worksheets[0]
+
+    # Phase 0: Adjust day columns to match month length
+    day_end_col, date_row, weekday_row = _adjust_cleaning_day_columns(ws, days_in_month)
 
     # Discover segment positions in this template.
     title_rows = _find_segment_title_rows(ws)

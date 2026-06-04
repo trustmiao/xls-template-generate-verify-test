@@ -835,6 +835,48 @@ def _clear_data_row(
         ws.cell(row_num, col, value="")
 
 
+# Reuse shared column-adjust helpers
+from ..common.col_adjust import (
+    shift_formula_cols,
+    update_all_formulas_for_col_change,
+    delete_cols_with_formulas,
+    insert_cols_with_formulas,
+)
+
+
+# ---------------------------------------------------------------------------
+# Day-column adjustment (add/remove columns to match month length)
+# ---------------------------------------------------------------------------
+
+def _adjust_day_columns(ws, struct: SheetStruct, days_in_month: int) -> int:
+    """Adjust day columns to match target month days.
+
+    Returns net columns added (positive) or removed (negative).
+    """
+    tpl_days = struct.day_end_col - struct.day_start_col + 1 if struct.day_end_col else 31
+    diff = days_in_month - tpl_days
+    if diff == 0:
+        return 0
+
+    if diff < 0:
+        # Delete excess columns
+        delete_from = struct.day_start_col + days_in_month
+        delete_count = -diff
+        delete_cols_with_formulas(ws, delete_from, delete_count)
+        struct.day_end_col = struct.day_start_col + days_in_month - 1
+    else:
+        # Insert columns
+        insert_at = struct.day_end_col + 1 if struct.day_end_col else struct.day_start_col + tpl_days
+        insert_cols_with_formulas(
+            ws, insert_at, diff,
+            date_row=struct.date_row,
+            weekday_row=struct.header_row,
+        )
+        struct.day_end_col = (struct.day_end_col or struct.day_start_col + tpl_days - 1) + diff
+
+    return diff
+
+
 # ---------------------------------------------------------------------------
 # Date / title updates
 # ---------------------------------------------------------------------------
@@ -1035,6 +1077,10 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
 
         if not struct.segments:
             continue
+
+        # Phase 0: Adjust day columns to match month length
+        days_in_month = calendar.monthrange(year, month_num)[1]
+        _adjust_day_columns(ws, struct, days_in_month)
 
         if project_id and category_id and month:
             actual_rows = _build_shift_data_from_api(shift, project_id, category_id, month)
