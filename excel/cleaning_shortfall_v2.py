@@ -314,13 +314,37 @@ def _find_segment_title_rows(ws) -> Dict[str, int]:
 
 
 def _find_data_row(ws, start_row: int, end_row: int) -> int | None:
+    r"""Find the first personnel data row in a segment.
+
+    v1 templates have =SUM(D\d+:D\d+) with equal row numbers on data rows.
+    v2 templates use plain values; we fall back to rank pattern (A\d+) in col B.
+    """
+    # v1 template: look for single-row SUM formula
     for r in range(start_row + 1, end_row + 1):
         v = ws.cell(r, DAY_START_COL).value
         if v and isinstance(v, str):
             m = _SUM_SINGLE_RE.match(v)
             if m and m.group(2) == m.group(3):
                 return int(m.group(2))
+    # v2 template: look for rank pattern in col B
+    for r in range(start_row + 1, end_row + 1):
+        b = ws.cell(r, RANK_COL).value
+        if b and isinstance(b, str) and _RANK_RE.match(b.strip()):
+            return r
     return None
+
+
+_RANK_RE = re.compile(r"^A\d+$")
+
+
+def _count_template_personnel_rows(ws, start_row: int, end_row: int) -> int:
+    """Count how many template personnel rows exist between start and end."""
+    count = 0
+    for r in range(start_row, end_row + 1):
+        b = ws.cell(r, RANK_COL).value
+        if b and isinstance(b, str) and _RANK_RE.match(b.strip()):
+            count += 1
+    return count
 
 
 def _insert_and_style(ws, insert_at: int, amount: int, source_row: int) -> None:
@@ -448,16 +472,18 @@ def _fill_data_row(ws, r: int, row_data: Dict[str, Any], days_in_month: int) -> 
 # Main entry
 # ---------------------------------------------------------------------------
 
+def _fetch_data(context: Dict[str, Any]) -> Dict[str, Any]:
+    """Call the API to fetch roster data.  Extracted so tests can monkey-patch."""
+    from ...api.shortfall_engine import api_shortfall_engine
+    return api_shortfall_engine(
+        shift="A", project_id=context["project_id"],
+        category_id=context["category_id"], month=context["month"],
+    )
+
+
 def run(wb: Workbook, context: Dict[str, Any]) -> None:
     """Fill the cleaning roster template (v2) for the 31-day pre-configured template."""
-    project_id = context["project_id"]
-    category_id = context["category_id"]
-    month = context["month"]
-
-    from ...api.shortfall_engine import api_shortfall_engine
-    data = api_shortfall_engine(
-        shift="A", project_id=project_id, category_id=category_id, month=month
-    )
+    data = _fetch_data(context)
     if not data.get("has_data"):
         return
 
@@ -470,7 +496,7 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
     day_end_col = _adjust_day_columns(ws, days_in_month)
 
     # Phase 1: Update dates to target month
-    _update_dates(ws, month)
+    _update_dates(ws, context["month"])
 
     # Discover segment positions
     title_rows = _find_segment_title_rows(ws)
@@ -501,12 +527,31 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
         rows = seg["rows"]
         n = len(rows)
         template_data_row = sb["data_row"]
-        end_row = template_data_row + n - 1
-        if n > 1:
-            insert_at = template_data_row + 1
-            _insert_and_style(ws, insert_at, n - 1, source_row=template_data_row)
-            _shift_formulas(ws, insert_at, n - 1)
-            _expand_range(ws, template_data_row, end_row)
-            _copy_row_formulas(ws, template_data_row, insert_at, n - 1)
+        template_count = _count_template_personnel_rows(ws, template_data_row, sb["end_row"])
+
+        if n < template_count:
+            # Remove excess template rows
+            delete_from = template_data_row + n
+            delete_count = template_count - n
+            ws.delete_rows(delete_from, delete_count)
+            # Update row numbers for all subsequent sections
+            for other_sb in section_bounds.values():
+                for key in ("title_row", "data_row", "end_row"):
+                    if other_sb[key] > delete_from:
+                        other_sb[key] -= delete_count
+        elif n > template_count:
+            # Insert additional rows
+            insert_at = template_data_row + template_count
+            insert_count = n - template_count
+            _insert_and_style(ws, insert_at, insert_count, source_row=template_data_row)
+            _shift_formulas(ws, insert_at, insert_count)
+            _expand_range(ws, template_data_row, template_data_row + n - 1)
+            _copy_row_formulas(ws, template_data_row, insert_at, insert_count)
+            # Update row numbers for all subsequent sections
+            for other_sb in section_bounds.values():
+                for key in ("title_row", "data_row", "end_row"):
+                    if other_sb[key] >= insert_at:
+                        other_sb[key] += insert_count
+
         for idx, row_data in enumerate(rows):
             _fill_data_row(ws, template_data_row + idx, row_data, days_in_month)

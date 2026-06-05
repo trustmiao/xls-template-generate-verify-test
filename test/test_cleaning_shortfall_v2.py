@@ -134,3 +134,124 @@ class TestEndToEnd:
         assert result["ok"], result["errors"]
         assert result["days"] == 31
         assert result["weeks"] == 5
+
+
+class TestRowAdjustment:
+    """Tests for personnel row insertion/deletion."""
+
+    def _make_rows(self, n: int, days: int = 28):
+        rows = []
+        for i in range(n):
+            cells = [{"day": d, "value": 8} for d in range(1, days + 1)]
+            rows.append({"rank_seq": f"A{i+1}", "name": f"Person{i+1}", "cells": cells})
+        return rows
+
+    def test_delete_to_one_person_per_segment(self, template_wb):
+        """When API returns 1 person per segment, excess template rows are deleted."""
+        from ..excel.cleaning_shortfall_v2 import run
+        from unittest.mock import patch
+
+        ws = template_wb.worksheets[0]
+        _adjust_day_columns(ws, 28)
+        _update_dates(ws, "2026-02")
+
+        mock_data = {
+            "has_data": True,
+            "days_in_month": 28,
+            "segments": [
+                {"title": "1. 清潔科文", "rows": self._make_rows(1)},
+                {"title": "2. 清潔工人", "rows": self._make_rows(1)},
+                {"title": "3. VO清潔工人", "rows": self._make_rows(1)},
+            ],
+        }
+
+        with patch("app.engine.excel.cleaning_shortfall_v2._fetch_data", return_value=mock_data):
+            run(template_wb, {"project_id": 1, "category_id": 2, "month": "2026-02"})
+
+        # Helper: find personnel rows under a given title row
+        def find_personnel(title_fragment):
+            for r in range(1, ws.max_row + 1):
+                if title_fragment in str(ws.cell(r, 2).value or ""):
+                    people = []
+                    for pr in range(r + 1, ws.max_row + 1):
+                        b = ws.cell(pr, 2).value
+                        if b and isinstance(b, str) and b.startswith("A"):
+                            people.append(pr)
+                        elif b and "每天工作總時數" in b:
+                            break
+                    return people
+            return []
+
+        # Segment 1: should have 1 person
+        seg1 = find_personnel("清潔科文")
+        assert len(seg1) == 1
+        assert ws.cell(seg1[0], 2).value == "A1"
+        # Next row should be daily-total, not another person
+        nxt = ws.cell(seg1[0] + 1, 2).value
+        assert nxt is None or not str(nxt).startswith("A")
+
+        # Segment 2: should have 1 person
+        seg2 = find_personnel("清潔工人")
+        assert len(seg2) == 1
+        assert ws.cell(seg2[0], 2).value == "A1"
+        nxt = ws.cell(seg2[0] + 1, 2).value
+        assert nxt is None or not str(nxt).startswith("A")
+
+        # Segment 3: should have 1 person
+        seg3 = find_personnel("VO清潔工人")
+        assert len(seg3) == 1
+        assert ws.cell(seg3[0], 2).value == "A1"
+        nxt = ws.cell(seg3[0] + 1, 2).value
+        assert nxt is None or not str(nxt).startswith("A")
+
+    def test_add_two_people_per_segment(self, template_wb):
+        """When API returns 4/19/5 people, extra rows are inserted."""
+        from ..excel.cleaning_shortfall_v2 import run
+        from unittest.mock import patch
+
+        ws = template_wb.worksheets[0]
+        _adjust_day_columns(ws, 28)
+        _update_dates(ws, "2026-02")
+
+        mock_data = {
+            "has_data": True,
+            "days_in_month": 28,
+            "segments": [
+                {"title": "1. 清潔科文", "rows": self._make_rows(4)},
+                {"title": "2. 清潔工人", "rows": self._make_rows(19)},
+                {"title": "3. VO清潔工人", "rows": self._make_rows(5)},
+            ],
+        }
+
+        with patch("app.engine.excel.cleaning_shortfall_v2._fetch_data", return_value=mock_data):
+            run(template_wb, {"project_id": 1, "category_id": 2, "month": "2026-02"})
+
+        def find_personnel(title_fragment):
+            for r in range(1, ws.max_row + 1):
+                if title_fragment in str(ws.cell(r, 2).value or ""):
+                    people = []
+                    for pr in range(r + 1, ws.max_row + 1):
+                        b = ws.cell(pr, 2).value
+                        if b and isinstance(b, str) and b.startswith("A"):
+                            people.append(pr)
+                        elif b and "每天工作總時數" in b:
+                            break
+                    return people
+            return []
+
+        # Segment 1: should have 4 people
+        seg1 = find_personnel("清潔科文")
+        assert len(seg1) == 4
+        for i, pr in enumerate(seg1):
+            assert ws.cell(pr, 2).value == f"A{i+1}"
+        # Next row should be daily-total
+        nxt = ws.cell(seg1[-1] + 1, 2).value
+        assert nxt is None or "每天工作總時數" in str(nxt)
+
+        # Segment 3: should have 5 people
+        seg3 = find_personnel("VO清潔工人")
+        assert len(seg3) == 5
+        for i, pr in enumerate(seg3):
+            assert ws.cell(pr, 2).value == f"A{i+1}"
+        nxt = ws.cell(seg3[-1] + 1, 2).value
+        assert nxt is None or "每天工作總時數" in str(nxt)
