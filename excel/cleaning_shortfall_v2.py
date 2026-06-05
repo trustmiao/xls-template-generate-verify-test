@@ -165,25 +165,26 @@ def _adjust_day_columns(ws, days_in_month: int) -> int:
     # cell when the deleted column is removed.
     from openpyxl.worksheet.cell_range import CellRange
     for old, new, tl_value, tl_style_snap, tl_has_style in affected:
-        if new and (tl_has_style or tl_value is not None):
-            new_cr = CellRange(new)
-            key = (new_cr.min_row, new_cr.min_col)
-            if key in ws._cells and type(ws._cells[key]).__name__ == "MergedCell":
-                del ws._cells[key]
-            new_tl = ws.cell(new_cr.min_row, new_cr.min_col)
-            if tl_value is not None:
-                # Formulas captured before delete_cols still reference the old
-                # column letters; shift them to match the post-delete layout.
-                if isinstance(tl_value, str) and tl_value.startswith("="):
-                    from ..common.col_adjust import shift_formula_cols
-                    tl_value = shift_formula_cols(tl_value, delete_from, -diff, is_delete=True)
-                new_tl.value = tl_value
-            if tl_has_style and tl_style_snap is not None:
-                _restore_cell_style(new_tl, tl_style_snap)
-            # Explicitly re-merge the range.  openpyxl's delete_cols can drop
-            # or corrupt merged-cell metadata when the top-left column is
-            # deleted, so we re-create the merge after restoring the cell.
-            ws.merge_cells(new)
+        if not new:
+            continue
+        new_cr = CellRange(new)
+        key = (new_cr.min_row, new_cr.min_col)
+        if key in ws._cells and type(ws._cells[key]).__name__ == "MergedCell":
+            del ws._cells[key]
+        new_tl = ws.cell(new_cr.min_row, new_cr.min_col)
+        if tl_value is not None:
+            # Formulas captured before delete_cols still reference the old
+            # column letters; shift them to match the post-delete layout.
+            if isinstance(tl_value, str) and tl_value.startswith("="):
+                from ..common.col_adjust import shift_formula_cols
+                tl_value = shift_formula_cols(tl_value, delete_from, -diff, is_delete=True)
+            new_tl.value = tl_value
+        if tl_has_style and tl_style_snap is not None:
+            _restore_cell_style(new_tl, tl_style_snap)
+        # Explicitly re-merge the range.  openpyxl's delete_cols can drop
+        # or corrupt merged-cell metadata when the range overlaps deleted
+        # columns, so we re-create the merge for *every* adjusted range.
+        ws.merge_cells(new)
 
     return DAY_START_COL + days_in_month - 1
 
