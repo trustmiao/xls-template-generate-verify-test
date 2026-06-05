@@ -13,7 +13,6 @@ Example:
 
 import re
 import sys
-import copy
 from pathlib import Path
 
 try:
@@ -21,6 +20,12 @@ try:
 except ImportError:
     print("Error: openpyxl is required. Install with: pip install openpyxl")
     sys.exit(1)
+
+from excel_row_ops import (
+    adjust_all_formulas,
+    safe_delete_rows,
+    adjust_conditional_formatting,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -87,142 +92,6 @@ def detect_roster_regions(ws):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Formula Adjustment
-# ──────────────────────────────────────────────────────────────────────────────
-
-def adjust_formula(formula, deleted_row):
-    """
-    Adjust all cell references in an Excel formula after a row is deleted.
-
-    Rules:
-      - Any row reference > deleted_row is decremented by 1.
-      - Row references <= deleted_row are left unchanged.
-    """
-    # Pattern matches: AN20 or AN8:AN20
-    cell_ref_pattern = re.compile(r'([A-Z]+)(\d+)')
-
-    def replace_range(match):
-        full = match.group(0)
-        if ':' in full:
-            parts = full.split(':')
-            new_parts = []
-            for part in parts:
-                m = cell_ref_pattern.match(part)
-                if m:
-                    col, row_num = m.group(1), int(m.group(2))
-                    if row_num > deleted_row:
-                        row_num -= 1
-                    new_parts.append(f"{col}{row_num}")
-                else:
-                    new_parts.append(part)
-            return ':'.join(new_parts)
-        else:
-            m = cell_ref_pattern.match(full)
-            if m:
-                col, row_num = m.group(1), int(m.group(2))
-                if row_num > deleted_row:
-                    row_num -= 1
-                return f"{col}{row_num}"
-            return full
-
-    # Match either a range like AN8:AN20 or a single cell like AN20
-    return re.sub(r'[A-Z]+\d+(?::[A-Z]+\d+)?', replace_range, formula)
-
-
-def adjust_all_formulas(ws, deleted_row):
-    """Scan entire worksheet and adjust every formula after a row deletion."""
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row):
-        for cell in row:
-            val = cell.value
-            if val and isinstance(val, str) and val.startswith('='):
-                cell.value = adjust_formula(val, deleted_row)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Row Deletion
-# ──────────────────────────────────────────────────────────────────────────────
-
-def safe_delete_rows(ws, idx, amount=1):
-    """
-    Delete rows, correctly mimicking Excel behavior.
-    Replaces openpyxl's ws.delete_rows() which has an iter_rows bug that
-    creates phantom empty cells which then overwrite valid data during shift.
-    """
-    max_row = max((row for row, col in ws._cells.keys()), default=0)
-
-    for r in range(idx, max_row + 1):
-        source_r = r + amount
-        if source_r > max_row:
-            for key in list(ws._cells.keys()):
-                if key[0] == r:
-                    del ws._cells[key]
-            continue
-
-        target_cols = {col for row, col in ws._cells.keys() if row == r}
-        source_cols = {col for row, col in ws._cells.keys() if row == source_r}
-
-        for col in target_cols - source_cols:
-            del ws._cells[(r, col)]
-
-        for col in source_cols:
-            if (source_r, col) in ws._cells:
-                cell = ws._cells[(source_r, col)]
-                ws._cells[(r, col)] = cell
-                cell.row = r
-                del ws._cells[(source_r, col)]
-
-    for r in range(idx, max_row + 1):
-        source_r = r + amount
-        dst_rd = ws.row_dimensions[r]
-        if source_r in ws.row_dimensions:
-            src_rd = ws.row_dimensions[source_r]
-            dst_rd.height = src_rd.height
-            if src_rd._style is not None:
-                from copy import copy
-                dst_rd._style = copy(src_rd._style)
-            else:
-                dst_rd._style = None
-            dst_rd.hidden = src_rd.hidden
-            dst_rd.outline_level = src_rd.outline_level
-            dst_rd.collapsed = src_rd.collapsed
-        else:
-            dst_rd.height = None
-            dst_rd._style = None
-            dst_rd.hidden = False
-            dst_rd.outline_level = 0
-            dst_rd.collapsed = False
-
-    ws._current_row = max(row for row, col in ws._cells.keys()) if ws._cells else 0
-
-
-def delete_rows_in_region(ws, region, n):
-    """
-    Delete n rows from a roster region, starting at the 2nd data row.
-
-    The region's first data row is kept; rows 2 .. (n+1) are removed.
-    After deletion, all formulas in the worksheet are adjusted.
-
-    Returns the list of original row numbers that were deleted.
-    """
-    data_start = region['data_start']
-    # Delete rows data_start+1 through data_start+n
-    rows_to_delete = list(range(data_start + 1, data_start + n + 1))
-
-    if not rows_to_delete:
-        return []
-
-    # Delete in descending order so row numbers of earlier deletions
-    # don't shift the targets of later deletions.
-    for row in sorted(rows_to_delete, reverse=True):
-        # 1. Adjust formulas first (while row number is still valid in references)
-        adjust_all_formulas(ws, row)
-        # 2. Physically remove the row (safe replacement for ws.delete_rows)
-        safe_delete_rows(ws, row, 1)
-
-    return rows_to_delete
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Main Processing
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -280,6 +149,7 @@ def process_workbook(input_path, output_path, deletions):
             for row in sorted(all_rows_to_delete, reverse=True):
                 adjust_all_formulas(ws, row)
                 safe_delete_rows(ws, row, 1)
+                adjust_conditional_formatting(ws, row)
 
             for region_idx, rows in deletion_log.items():
                 print(f"   ✅ Deleted {len(rows)} row(s) from region {region_idx}: "

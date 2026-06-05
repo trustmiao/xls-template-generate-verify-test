@@ -17,13 +17,19 @@ import re
 import calendar
 from pathlib import Path
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
 
 import sys
 sys.path.insert(0, r"D:\claude\claude_hk\backend")
 from app.engine.excel.cleaning_shortfall_v2 import (
     _adjust_day_columns,
     _update_dates,
+)
+from excel_row_ops import (
+    adjust_all_formulas,
+    safe_delete_rows,
+    fix_merged_cells,
+    adjust_print_area,
+    adjust_conditional_formatting,
 )
 
 TEMPLATES = [
@@ -32,10 +38,10 @@ TEMPLATES = [
     ("TY-大元保安", "templates/TY-2026.03- SG_SEC-Deploy Roster  Shortfall - template.xlsx", [1, 2]),
 ]
 
-OUT_DIR = Path("test_outputs_issue6")
+OUT_DIR = Path("test_outputs_issue6_v2")
 OUT_DIR.mkdir(exist_ok=True)
 
-# ── Region detection (copied from delete_one_row.py) ──
+# ── Region detection ──
 rank_pattern = re.compile(r'^[A-Z]+\d+$')
 title_pattern = re.compile(r'^\d+\.\s+')
 
@@ -72,206 +78,18 @@ def detect_roster_regions(ws):
     return regions
 
 
-# ── Formula adjustment ──
-cell_ref = re.compile(r'(?<![A-Z$])(\$?[A-Z]{1,3})(\$?)(\d+)')
-
-
-def adjust_formula(formula, deleted_row):
-    """
-    Adjust cell references after deleting a row.
-
-    - Range refs (A1:A5): both bounds use >= rule (shrink range)
-    - Single refs (A1):    use > rule only (A1→#REF! if row==deleted)
-    """
-    # First, identify which refs are part of a range (contain ':' nearby)
-    # We'll do a two-pass: first find all ranges, mark their positions
-    range_positions = set()
-    range_pattern = re.compile(r'(?<![A-Z$])(\$?[A-Z]{1,3})(\$?)(\d+)(:(\$?[A-Z]{1,3})(\$?)(\d+))')
-    for m in range_pattern.finditer(formula):
-        range_positions.add((m.start(), m.end()))
-
-    result = []
-    last_end = 0
-
-    for match in cell_ref.finditer(formula):
-        # Skip if already handled as part of a range (we handle ranges below)
-        # Actually, cell_ref finditer will also match inside ranges.
-        # We need to detect if this match is inside a range match.
-        in_range = any(start <= match.start() < end for start, end in range_positions)
-
-        result.append(formula[last_end:match.start()])
-        col_part = match.group(1)
-        abs_row = match.group(2) == '$'
-        row_num = int(match.group(3))
-
-        if not abs_row:
-            if in_range:
-                # Range bounds: >= deleted_row → shift
-                if row_num >= deleted_row:
-                    row_num -= 1
-            else:
-                # Single ref: > deleted_row → shift; == deleted_row → #REF!
-                if row_num > deleted_row:
-                    row_num -= 1
-                elif row_num == deleted_row:
-                    result.append("#REF!")
-                    last_end = match.end()
-                    continue
-
-        result.append(f"{col_part}{'$' if abs_row else ''}{row_num}")
-        last_end = match.end()
-
-    result.append(formula[last_end:])
-    return ''.join(result)
-
-
-def adjust_all_formulas(ws, deleted_row):
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row):
-        for cell in row:
-            val = cell.value
-            if val and isinstance(val, str) and val.startswith('='):
-                cell.value = adjust_formula(val, deleted_row)
-
-
-def adjust_merged_range(range_str, deleted_row):
-    ref_pattern = re.compile(r'(\$?)([A-Z]{1,3})(\$?)(\d+)')
-
-    def parse_ref(ref):
-        m = ref_pattern.match(ref)
-        if m:
-            col_abs, col, row_abs, row = m.groups()
-            row = int(row)
-            if row > deleted_row:
-                row -= 1
-            return f"{col_abs}{col}{row_abs}{row}"
-        return ref
-
-    if ':' in range_str:
-        start, end = range_str.split(':')
-        return f"{parse_ref(start)}:{parse_ref(end)}"
-    return parse_ref(range_str)
-
-
-def fix_merged_cells(ws, deleted_row):
-    """
-    Adjust merged cell ranges after a row deletion WITHOUT unmerge+merge.
-
-    openpyxl's unmerge_cells + merge_cells has a side effect of copying
-    the top-left cell's style to ALL merged cells, which corrupts styles
-    (e.g. fills backgrounds white or overwrites custom colours).
-    We directly mutate MergedCellRange objects in place.
-    """
-    to_remove = []
-    for mr in list(ws.merged_cells.ranges):
-        if mr.min_row > deleted_row:
-            # Entirely below the deleted row — shift up by 1
-            mr.shift(-1, 0)
-        elif mr.max_row < deleted_row:
-            # Entirely above — no change
-            pass
-        else:
-            # deleted_row is inside or at the boundary of this range
-            if mr.min_row == mr.max_row == deleted_row:
-                # Single-row range that is completely deleted
-                to_remove.append(mr)
-            else:
-                # Reduce the range by 1 row at the bottom
-                mr.max_row -= 1
-                if mr.min_row > mr.max_row:
-                    to_remove.append(mr)
-
-    for mr in to_remove:
-        ws.merged_cells.ranges.remove(mr)
-
-
-def safe_delete_rows(ws, idx, amount=1):
-    """
-    Delete rows, correctly mimicking Excel behavior.
-    Replaces openpyxl's ws.delete_rows() which has an iter_rows bug that
-    creates phantom empty cells which then overwrite valid data during shift.
-    """
-    max_row = max((row for row, col in ws._cells.keys()), default=0)
-
-    for r in range(idx, max_row + 1):
-        source_r = r + amount
-        if source_r > max_row:
-            for key in list(ws._cells.keys()):
-                if key[0] == r:
-                    del ws._cells[key]
-            continue
-
-        target_cols = {col for row, col in ws._cells.keys() if row == r}
-        source_cols = {col for row, col in ws._cells.keys() if row == source_r}
-
-        for col in target_cols - source_cols:
-            del ws._cells[(r, col)]
-
-        for col in source_cols:
-            if (source_r, col) in ws._cells:
-                cell = ws._cells[(source_r, col)]
-                ws._cells[(r, col)] = cell
-                cell.row = r
-                del ws._cells[(source_r, col)]
-
-    # Update row dimensions (height + style + other attrs)
-    for r in range(idx, max_row + 1):
-        source_r = r + amount
-        dst_rd = ws.row_dimensions[r]
-        if source_r in ws.row_dimensions:
-            src_rd = ws.row_dimensions[source_r]
-            dst_rd.height = src_rd.height
-            if src_rd._style is not None:
-                from copy import copy
-                dst_rd._style = copy(src_rd._style)
-            else:
-                dst_rd._style = None
-            dst_rd.hidden = src_rd.hidden
-            dst_rd.outline_level = src_rd.outline_level
-            dst_rd.collapsed = src_rd.collapsed
-        else:
-            dst_rd.height = None
-            dst_rd._style = None
-            dst_rd.hidden = False
-            dst_rd.outline_level = 0
-            dst_rd.collapsed = False
-
-    ws._current_row = max(row for row, col in ws._cells.keys()) if ws._cells else 0
-
-
-def adjust_print_area(ws, deleted_row):
-    """Adjust print-area row numbers after a row is deleted."""
-    if not ws.print_area or not ws._print_area:
-        return
-    for cr in ws._print_area.ranges:
-        if cr.min_row > deleted_row:
-            cr.min_row -= 1
-        if cr.max_row > deleted_row:
-            cr.max_row -= 1
-
-
 # ── Core deletion ──
 def delete_second_row_of_region(ws, region):
-    """Delete the 2nd data row of a region and fix formulas + merged cells + print area."""
+    """Delete the 2nd data row of a region and fix formulas + merged cells + print area + conditional formatting."""
     row_to_delete = region['data_start'] + 1
     if row_to_delete > region['data_end']:
         return False
 
-    merged_ranges = [str(mc) for mc in ws.merged_cells.ranges]
     adjust_all_formulas(ws, row_to_delete)
     safe_delete_rows(ws, row_to_delete, 1)
-
-    for mc_str in merged_ranges:
-        try:
-            ws.unmerge_cells(mc_str)
-        except Exception:
-            pass
-    for mc_str in merged_ranges:
-        adjusted = adjust_merged_range(mc_str, row_to_delete)
-        try:
-            ws.merge_cells(adjusted)
-        except Exception:
-            pass
+    fix_merged_cells(ws, row_to_delete)
     adjust_print_area(ws, row_to_delete)
+    adjust_conditional_formatting(ws, row_to_delete)
     return True
 
 
