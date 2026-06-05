@@ -361,10 +361,18 @@ def _insert_and_style(ws, insert_at: int, amount: int, source_row: int) -> None:
             continue
         affected.append((str(mr), str(new)))
     for old, _ in affected:
-        ws.unmerge_cells(old)
+        try:
+            ws.unmerge_cells(old)
+        except KeyError:
+            # Range may reference cells already removed by a prior delete_rows.
+            pass
     ws.insert_rows(insert_at, amount=amount)
     for _, new in affected:
-        ws.merge_cells(new)
+        try:
+            ws.merge_cells(new)
+        except ValueError:
+            # Range may already exist after prior insert_rows adjustments.
+            pass
     _shift_print_area(ws, insert_at, amount)
     for off in range(amount):
         target_row = insert_at + off
