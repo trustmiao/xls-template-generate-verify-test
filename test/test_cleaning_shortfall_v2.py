@@ -10,17 +10,23 @@ from openpyxl import load_workbook
 from ..excel.cleaning_shortfall_v2 import (
     _adjust_day_columns,
     _update_dates,
-    _shift_merged_cols_for_delete,
+    _find_date_start,
     DAY_START_COL,
     TEMPLATE_DAYS,
 )
 
 TEMPLATE_PATH = r"D:\claude\claude_hk\backend\data\doc\output_templates\东汇邨\保洁\东汇-保洁轮休表_template.xlsx"
+SECURITY_TEMPLATE_PATH = r"D:\claude\claude_hk\backend\app\engine\templates\东汇-保安轮休表template.xlsx"
 
 
 @pytest.fixture
 def template_wb():
     return load_workbook(TEMPLATE_PATH, data_only=False)
+
+
+@pytest.fixture
+def security_wb():
+    return load_workbook(SECURITY_TEMPLATE_PATH, data_only=False)
 
 
 class TestAdjustDayColumns:
@@ -100,6 +106,73 @@ class TestUpdateDates:
         assert first.year == 2026
         assert first.month == 5
         assert first.day == 1
+
+
+class TestSecurityTemplate:
+    """Tests for security template (东汇-保安轮休表) day-column adjustment."""
+
+    def test_30_days_deletes_correct_column(self, security_wb):
+        """Day 31 column (AM) should be deleted, not AH."""
+        ws = security_wb.worksheets[0]
+        day_end = _adjust_day_columns(ws, 30)
+
+        # Security template dates start at I (col 9)
+        # 30 days → day_end = 9 + 30 - 1 = 38 (AL)
+        assert day_end == 38  # AL
+
+        date_row, first_col = _find_date_start(ws)
+        assert first_col == 9  # I
+
+        # All 30 day columns must have values
+        for c in range(first_col, first_col + 30):
+            assert ws.cell(6, c).value is not None, f"col {c} should have date value"
+
+        # 31st column should now be 工作總日數 (shifted left from AN)
+        v = ws.cell(6, first_col + 30).value
+        assert "工作總" in str(v)
+
+    def test_28_days_deletes_three_columns(self, security_wb):
+        ws = security_wb.worksheets[0]
+        day_end = _adjust_day_columns(ws, 28)
+
+        # 28 days → day_end = 9 + 28 - 1 = 36 (AJ)
+        assert day_end == 36  # AJ
+
+        date_row, first_col = _find_date_start(ws)
+
+        # 28 day columns present
+        for c in range(first_col, first_col + 28):
+            assert ws.cell(6, c).value is not None
+
+        # 29th column should be 工作總日數
+        v = ws.cell(6, first_col + 28).value
+        assert "工作總" in str(v)
+
+    def test_count_formulas_stay_correct(self, security_wb):
+        ws = security_wb.worksheets[0]
+        _adjust_day_columns(ws, 30)
+
+        date_row, first_col = _find_date_start(ws)
+        # Row 14 has COUNT formulas for each day
+        for c in range(first_col, first_col + 30):
+            letter = __import__("openpyxl").utils.get_column_letter(c)
+            expected = f"=COUNT({letter}8:{letter}10)"
+            assert ws.cell(14, c).value == expected
+
+        # Total sum formula
+        total_col = first_col + 30
+        first_letter = __import__("openpyxl").utils.get_column_letter(first_col)
+        last_letter = __import__("openpyxl").utils.get_column_letter(first_col + 29)
+        expected_total = f"=SUM({first_letter}14:{last_letter}14)"
+        assert ws.cell(14, total_col).value == expected_total
+
+    def test_merged_cells_shift_correctly(self, security_wb):
+        ws = security_wb.worksheets[0]
+        _adjust_day_columns(ws, 30)
+
+        merges = [str(mr) for mr in ws.merged_cells.ranges]
+        # AO6:AO7 should shift to AN6:AN7 after deleting AM
+        assert any("AN6:AN7" in m for m in merges)
 
 
 class TestEndToEnd:
