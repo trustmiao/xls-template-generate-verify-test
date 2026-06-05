@@ -147,28 +147,50 @@ def adjust_merged_range(range_str, deleted_row):
     return parse_ref(range_str)
 
 
-def shift_row_styles_up(ws, start_row):
+def safe_delete_rows(ws, idx, amount=1):
     """
-    Prepare row deletion by shifting row heights and removing orphaned cells.
-    openpyxl's delete_rows() already moves existing cells (including their
-    styles) up, but it does NOT touch row heights, and it leaves behind
-    cells in the deleted row when the cell above them doesn't exist.
-    This function mimics Excel's delete-row behaviour for those two cases.
+    Delete rows, correctly mimicking Excel behavior.
+    Replaces openpyxl's ws.delete_rows() which has an iter_rows bug that
+    creates phantom empty cells which then overwrite valid data during shift.
     """
-    max_row = ws.max_row
+    max_row = max((row for row, col in ws._cells.keys()), default=0)
 
-    for r in range(start_row, max_row):
-        # 1. Shift row height up
-        ws.row_dimensions[r].height = ws.row_dimensions[r + 1].height
+    # Process each row from top to bottom
+    for r in range(idx, max_row + 1):
+        source_r = r + amount
+        if source_r > max_row:
+            # No source row, just clear this row
+            for key in list(ws._cells.keys()):
+                if key[0] == r:
+                    del ws._cells[key]
+            continue
 
-        # 2. Remove cells in row r whose counterpart in row r+1 does not exist.
-        #    delete_rows will move r+1's cells to r, but if r+1 has no cell
-        #    in that column, r's cell would incorrectly survive the deletion.
-        cols_in_r = {col for (row, col), cell in ws._cells.items() if row == r}
-        cols_in_r1 = {col for (row, col), cell in ws._cells.items() if row == r + 1}
-        for c in cols_in_r - cols_in_r1:
-            if (r, c) in ws._cells:
-                del ws._cells[(r, c)]
+        # Get columns in target and source
+        target_cols = {col for row, col in ws._cells.keys() if row == r}
+        source_cols = {col for row, col in ws._cells.keys() if row == source_r}
+
+        # Delete cells in target that don't exist in source
+        for col in target_cols - source_cols:
+            del ws._cells[(r, col)]
+
+        # Move cells from source to target
+        for col in source_cols:
+            if (source_r, col) in ws._cells:
+                cell = ws._cells[(source_r, col)]
+                ws._cells[(r, col)] = cell
+                cell.row = r
+                del ws._cells[(source_r, col)]
+
+    # Update row dimensions
+    for r in range(idx, max_row + 1):
+        source_r = r + amount
+        if source_r in ws.row_dimensions:
+            ws.row_dimensions[r].height = ws.row_dimensions[source_r].height
+        elif r in ws.row_dimensions:
+            ws.row_dimensions[r].height = None
+
+    # Update current_row
+    ws._current_row = max(row for row, col in ws._cells.keys()) if ws._cells else 0
 
 
 def adjust_print_area(ws, deleted_row):
@@ -247,13 +269,10 @@ def process_workbook(input_path, output_path, region_index):
         merged_ranges = [str(mc) for mc in ws.merged_cells.ranges]
         adjust_all_formulas(ws, row_to_delete)
 
-        # 2. Shift styles up BEFORE delete_rows (openpyxl does NOT move styles)
-        shift_row_styles_up(ws, row_to_delete)
+        # 2. Physically remove the row (safe replacement for ws.delete_rows)
+        safe_delete_rows(ws, row_to_delete, 1)
 
-        # 3. Physically remove the row
-        ws.delete_rows(row_to_delete, 1)
-
-        # 4. Fix merged cells (delete_rows does NOT update them)
+        # 3. Fix merged cells (safe_delete_rows does NOT update them)
         for mc_str in merged_ranges:
             try:
                 ws.unmerge_cells(mc_str)
@@ -266,7 +285,7 @@ def process_workbook(input_path, output_path, region_index):
             except Exception as e:
                 print(f"      ⚠️  Could not merge {adjusted}: {e}")
 
-        # 5. Adjust print area
+        # 4. Adjust print area
         adjust_print_area(ws, row_to_delete)
 
         print(f"   ✅ Done. Original row {row_to_delete} deleted.")

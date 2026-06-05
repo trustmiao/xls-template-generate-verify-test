@@ -142,6 +142,45 @@ def adjust_all_formulas(ws, deleted_row):
 # Row Deletion
 # ──────────────────────────────────────────────────────────────────────────────
 
+def safe_delete_rows(ws, idx, amount=1):
+    """
+    Delete rows, correctly mimicking Excel behavior.
+    Replaces openpyxl's ws.delete_rows() which has an iter_rows bug that
+    creates phantom empty cells which then overwrite valid data during shift.
+    """
+    max_row = max((row for row, col in ws._cells.keys()), default=0)
+
+    for r in range(idx, max_row + 1):
+        source_r = r + amount
+        if source_r > max_row:
+            for key in list(ws._cells.keys()):
+                if key[0] == r:
+                    del ws._cells[key]
+            continue
+
+        target_cols = {col for row, col in ws._cells.keys() if row == r}
+        source_cols = {col for row, col in ws._cells.keys() if row == source_r}
+
+        for col in target_cols - source_cols:
+            del ws._cells[(r, col)]
+
+        for col in source_cols:
+            if (source_r, col) in ws._cells:
+                cell = ws._cells[(source_r, col)]
+                ws._cells[(r, col)] = cell
+                cell.row = r
+                del ws._cells[(source_r, col)]
+
+    for r in range(idx, max_row + 1):
+        source_r = r + amount
+        if source_r in ws.row_dimensions:
+            ws.row_dimensions[r].height = ws.row_dimensions[source_r].height
+        elif r in ws.row_dimensions:
+            ws.row_dimensions[r].height = None
+
+    ws._current_row = max(row for row, col in ws._cells.keys()) if ws._cells else 0
+
+
 def delete_rows_in_region(ws, region, n):
     """
     Delete n rows from a roster region, starting at the 2nd data row.
@@ -163,8 +202,8 @@ def delete_rows_in_region(ws, region, n):
     for row in sorted(rows_to_delete, reverse=True):
         # 1. Adjust formulas first (while row number is still valid in references)
         adjust_all_formulas(ws, row)
-        # 2. Physically remove the row
-        ws.delete_rows(row, 1)
+        # 2. Physically remove the row (safe replacement for ws.delete_rows)
+        safe_delete_rows(ws, row, 1)
 
     return rows_to_delete
 
@@ -226,7 +265,7 @@ def process_workbook(input_path, output_path, deletions):
         if all_rows_to_delete:
             for row in sorted(all_rows_to_delete, reverse=True):
                 adjust_all_formulas(ws, row)
-                ws.delete_rows(row, 1)
+                safe_delete_rows(ws, row, 1)
 
             for region_idx, rows in deletion_log.items():
                 print(f"   ✅ Deleted {len(rows)} row(s) from region {region_idx}: "
