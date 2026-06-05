@@ -358,104 +358,123 @@ def _fill_data_row(ws, r: int, row_data: Dict[str, Any], days_in_month: int, day
 # Main entry
 # ---------------------------------------------------------------------------
 
-def _fetch_data(context: Dict[str, Any]) -> Dict[str, Any]:
-    """Call the API to fetch roster data.  Extracted so tests can monkey-patch."""
+# ── Sheet → shift mapping ──
+_SHEET_SHIFT_MAP = {"早": "A", "中": "B", "夜": "C"}
+
+
+def _shift_from_sheet_name(sheet_name: str) -> str:
+    return _SHEET_SHIFT_MAP.get(sheet_name, "A")
+
+
+def _fetch_data(context: Dict[str, Any], shift: str) -> Dict[str, Any]:
+    """Call the API to fetch roster data for a specific shift.
+
+    Extracted so tests can monkey-patch.
+    """
     from ...api.shortfall_engine import api_shortfall_engine
     return api_shortfall_engine(
-        shift="A", project_id=context["project_id"],
+        shift=shift, project_id=context["project_id"],
         category_id=context["category_id"], month=context["month"],
     )
 
 
 def run(wb: Workbook, context: Dict[str, Any]) -> None:
-    """Fill the cleaning roster template (v2) for the 31-day pre-configured template."""
-    data = _fetch_data(context)
-    if not data.get("has_data"):
-        return
+    """Fill the cleaning roster template (v2) for the 31-day pre-configured template.
 
-    segments = data.get("segments", [])
-    days_in_month = data.get("days_in_month", 31)
+    Supports both single-sheet (cleaning) and multi-sheet (security) templates.
+    For multi-sheet templates each sheet is processed independently with its
+    corresponding shift data (早→A, 中→B, 夜→C).
+    """
+    month = context["month"]
+    year, month_num = int(month[:4]), int(month[5:7])
+    days_in_month = calendar.monthrange(year, month_num)[1]
 
-    # Phase 0 + 1: Adjust day columns and update dates on EVERY sheet
     for ws in wb.worksheets:
         if ws.title == "Data":
             continue
-        # Detect template layout (date row + first date column)
+
+        # Phase 1: Adjust day columns and update dates
         date_row, day_start_col = _find_date_start(ws)
         if not day_start_col:
             continue
         _adjust_day_columns(ws, days_in_month)
-        _update_dates(ws, context["month"], date_row=date_row, day_start_col=day_start_col)
+        _update_dates(ws, month, date_row=date_row, day_start_col=day_start_col)
 
-    # -----------------------------------------------------------------------
-    # Data fill: currently only processes the first non-Data sheet.
-    # Multi-sheet templates (e.g. TY 早/中/夜) need per-shift data.
-    # -----------------------------------------------------------------------
-    ws = wb.worksheets[0]
-    if ws.title == "Data" and len(wb.worksheets) > 1:
-        ws = wb.worksheets[1]
-
-    date_row, day_start_col = _find_date_start(ws)
-    if not day_start_col:
-        return
-
-    # Discover segment positions
-    title_rows = _find_segment_title_rows(ws)
-    if not title_rows:
-        return
-    sorted_titles = sorted(title_rows.items(), key=lambda x: x[1])
-    section_bounds: Dict[str, Dict[str, int]] = {}
-    for i, (prefix, tr) in enumerate(sorted_titles):
-        end = sorted_titles[i + 1][1] - 1 if i + 1 < len(sorted_titles) else ws.max_row
-        dr = _find_data_row(ws, tr, end, day_start_col=day_start_col)
-        if dr is not None:
-            section_bounds[prefix] = {"title_row": tr, "data_row": dr, "end_row": end}
-
-    # Match API segments
-    api_by_prefix: Dict[str, Dict[str, Any]] = {}
-    for s in segments:
-        m = _TITLE_RE.match(s.get("title", ""))
-        if m:
-            api_by_prefix[m.group(1) + "."] = s
-
-    # Bottom-up: insert + fill per section
-    ordered = sorted(section_bounds.keys(), key=lambda p: section_bounds[p]["data_row"], reverse=True)
-    for prefix in ordered:
-        sb = section_bounds[prefix]
-        seg = api_by_prefix.get(prefix)
-        if not seg or not seg.get("rows"):
+        # Phase 2: Discover segment positions
+        title_rows = _find_segment_title_rows(ws)
+        if not title_rows:
             continue
-        rows = seg["rows"]
-        n = len(rows)
-        template_data_row = sb["data_row"]
-        template_count = _count_template_personnel_rows(ws, template_data_row, sb["end_row"])
+        sorted_titles = sorted(title_rows.items(), key=lambda x: x[1])
+        section_bounds: Dict[str, Dict[str, int]] = {}
+        for i, (prefix, tr) in enumerate(sorted_titles):
+            end = sorted_titles[i + 1][1] - 1 if i + 1 < len(sorted_titles) else ws.max_row
+            dr = _find_data_row(ws, tr, end, day_start_col=day_start_col)
+            if dr is not None:
+                section_bounds[prefix] = {"title_row": tr, "data_row": dr, "end_row": end}
 
-        if n < template_count:
-            # Remove excess template rows
-            delete_from = template_data_row + n
-            delete_count = template_count - n
-            # Delete from back to front so row numbers stay stable
-            for offset in range(delete_count - 1, -1, -1):
-                row = delete_from + offset
-                excel_row_ops.delete_row_and_fixup(ws, row)
-            # Update row numbers for all subsequent sections
-            for other_sb in section_bounds.values():
-                for key in ("title_row", "data_row", "end_row"):
-                    if other_sb[key] > delete_from:
-                        other_sb[key] -= delete_count
-        elif n > template_count:
-            # Insert additional rows
-            insert_at = template_data_row + template_count
-            insert_count = n - template_count
-            _insert_and_style(ws, insert_at, insert_count, source_row=template_data_row)
-            _shift_formulas(ws, insert_at, insert_count)
-            _expand_range(ws, template_data_row, template_data_row + n - 1)
-            _copy_row_formulas(ws, template_data_row, insert_at, insert_count)
-            # Update row numbers for all subsequent sections
-            for other_sb in section_bounds.values():
-                for key in ("title_row", "data_row", "end_row"):
-                    if other_sb[key] >= insert_at:
-                        other_sb[key] += insert_count
+        # Phase 3: Fetch data for this shift
+        shift = _shift_from_sheet_name(ws.title)
+        try:
+            data = _fetch_data(context, shift)
+        except Exception:
+            # DB / API not available — leave template data as-is
+            continue
 
-        for idx, row_data in enumerate(rows):
-            _fill_data_row(ws, template_data_row + idx, row_data, days_in_month, day_start_col=day_start_col)
+        if not data.get("has_data"):
+            # No data — clear all data rows
+            for prefix, sb in section_bounds.items():
+                for r in range(sb["data_row"], sb["end_row"] + 1):
+                    for col in range(1, ws.max_column + 1):
+                        ws.cell(r, col).value = ""
+            continue
+
+        segments = data.get("segments", [])
+
+        # Match API segments by "N." prefix
+        api_by_prefix: Dict[str, Dict[str, Any]] = {}
+        for s in segments:
+            m = _TITLE_RE.match(s.get("title", ""))
+            if m:
+                api_by_prefix[m.group(1) + "."] = s
+
+        # Phase 4: Bottom-up adjust row counts + fill data per section
+        ordered = sorted(section_bounds.keys(), key=lambda p: section_bounds[p]["data_row"], reverse=True)
+        for prefix in ordered:
+            sb = section_bounds[prefix]
+            seg = api_by_prefix.get(prefix)
+            if not seg or not seg.get("rows"):
+                continue
+            rows = seg["rows"]
+            n = len(rows)
+            template_data_row = sb["data_row"]
+            template_count = _count_template_personnel_rows(ws, template_data_row, sb["end_row"])
+
+            if n < template_count:
+                # Remove excess template rows
+                delete_from = template_data_row + n
+                delete_count = template_count - n
+                # Delete from back to front so row numbers stay stable
+                for offset in range(delete_count - 1, -1, -1):
+                    row = delete_from + offset
+                    excel_row_ops.delete_row_and_fixup(ws, row)
+                # Update row numbers for all subsequent sections
+                for other_sb in section_bounds.values():
+                    for key in ("title_row", "data_row", "end_row"):
+                        if other_sb[key] > delete_from:
+                            other_sb[key] -= delete_count
+            elif n > template_count:
+                # Insert additional rows
+                insert_at = template_data_row + template_count
+                insert_count = n - template_count
+                _insert_and_style(ws, insert_at, insert_count, source_row=template_data_row)
+                _shift_formulas(ws, insert_at, insert_count)
+                _expand_range(ws, template_data_row, template_data_row + n - 1)
+                _copy_row_formulas(ws, template_data_row, insert_at, insert_count)
+                # Update row numbers for all subsequent sections
+                for other_sb in section_bounds.values():
+                    for key in ("title_row", "data_row", "end_row"):
+                        if other_sb[key] >= insert_at:
+                            other_sb[key] += insert_count
+
+            for idx, row_data in enumerate(rows):
+                _fill_data_row(ws, template_data_row + idx, row_data, days_in_month, day_start_col=day_start_col)
