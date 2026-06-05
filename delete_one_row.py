@@ -147,6 +147,41 @@ def adjust_merged_range(range_str, deleted_row):
     return parse_ref(range_str)
 
 
+def shift_row_styles_up(ws, start_row):
+    """
+    Prepare row deletion by shifting row heights and removing orphaned cells.
+    openpyxl's delete_rows() already moves existing cells (including their
+    styles) up, but it does NOT touch row heights, and it leaves behind
+    cells in the deleted row when the cell above them doesn't exist.
+    This function mimics Excel's delete-row behaviour for those two cases.
+    """
+    max_row = ws.max_row
+
+    for r in range(start_row, max_row):
+        # 1. Shift row height up
+        ws.row_dimensions[r].height = ws.row_dimensions[r + 1].height
+
+        # 2. Remove cells in row r whose counterpart in row r+1 does not exist.
+        #    delete_rows will move r+1's cells to r, but if r+1 has no cell
+        #    in that column, r's cell would incorrectly survive the deletion.
+        cols_in_r = {col for (row, col), cell in ws._cells.items() if row == r}
+        cols_in_r1 = {col for (row, col), cell in ws._cells.items() if row == r + 1}
+        for c in cols_in_r - cols_in_r1:
+            if (r, c) in ws._cells:
+                del ws._cells[(r, c)]
+
+
+def adjust_print_area(ws, deleted_row):
+    """Adjust print-area row numbers after a row is deleted."""
+    if not ws.print_area or not ws._print_area:
+        return
+    for cr in ws._print_area.ranges:
+        if cr.min_row > deleted_row:
+            cr.min_row -= 1
+        if cr.max_row > deleted_row:
+            cr.max_row -= 1
+
+
 def fix_merged_cells(ws, deleted_row):
     """
     openpyxl's delete_rows does NOT update merged cell ranges.
@@ -212,11 +247,13 @@ def process_workbook(input_path, output_path, region_index):
         merged_ranges = [str(mc) for mc in ws.merged_cells.ranges]
         adjust_all_formulas(ws, row_to_delete)
 
-        # 2. Physically remove the row
+        # 2. Shift styles up BEFORE delete_rows (openpyxl does NOT move styles)
+        shift_row_styles_up(ws, row_to_delete)
+
+        # 3. Physically remove the row
         ws.delete_rows(row_to_delete, 1)
 
-        # 3. Fix merged cells (delete_rows does NOT update them)
-        # Remove old ranges and re-add with adjusted rows
+        # 4. Fix merged cells (delete_rows does NOT update them)
         for mc_str in merged_ranges:
             try:
                 ws.unmerge_cells(mc_str)
@@ -228,6 +265,9 @@ def process_workbook(input_path, output_path, region_index):
                 ws.merge_cells(adjusted)
             except Exception as e:
                 print(f"      ⚠️  Could not merge {adjusted}: {e}")
+
+        # 5. Adjust print area
+        adjust_print_area(ws, row_to_delete)
 
         print(f"   ✅ Done. Original row {row_to_delete} deleted.")
 
