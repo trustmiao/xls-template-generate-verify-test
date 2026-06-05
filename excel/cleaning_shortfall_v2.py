@@ -180,6 +180,10 @@ def _adjust_day_columns(ws, days_in_month: int) -> int:
                 new_tl.value = tl_value
             if tl_has_style and tl_style_snap is not None:
                 _restore_cell_style(new_tl, tl_style_snap)
+            # Explicitly re-merge the range.  openpyxl's delete_cols can drop
+            # or corrupt merged-cell metadata when the top-left column is
+            # deleted, so we re-create the merge after restoring the cell.
+            ws.merge_cells(new)
 
     return DAY_START_COL + days_in_month - 1
 
