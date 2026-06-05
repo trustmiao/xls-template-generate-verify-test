@@ -72,6 +72,19 @@ class TestAdjustDayColumns:
         # AI13:AM13 should shift to AF13:AJ13 (left by 3)
         assert any("AF13:AJ13" in m for m in merges)
 
+    def test_shifted_merge_preserves_border(self, template_wb):
+        """Merged cells shifted left by column deletion must keep their borders."""
+        ws = template_wb.worksheets[0]
+        # Snapshot original border of the merge that will shift (AI13:AM13)
+        orig_tl = ws.cell(13, 35)  # AI13
+        orig_border = orig_tl.border.left.style if orig_tl.border else None
+
+        _adjust_day_columns(ws, 28)
+
+        # After shift AI13:AM13 -> AF13:AJ13, check border preserved
+        new_tl = ws.cell(13, 32)  # AF13
+        assert new_tl.border.left.style == orig_border
+
 
 class TestUpdateDates:
     """Tests for _update_dates."""

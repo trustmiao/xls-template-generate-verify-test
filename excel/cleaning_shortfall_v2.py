@@ -35,15 +35,48 @@ _RANGE_RE = re.compile(r"([A-Z$]+)(\d+):\1(\d+)")
 # Merged-cell helpers
 # ---------------------------------------------------------------------------
 
-def _shift_merged_cols_for_delete(ws, delete_from: int, delete_count: int) -> List[Tuple[str, Optional[str], Any, Any, bool]]:
+def _snapshot_cell_style(cell):
+    """Deep-copy a cell's visual style attributes into a plain dict.
+
+    openpyxl's internal ``_style`` is just a style-id reference; copying it
+    does **not** copy borders/fonts/etc.  We explicitly snapshot every
+    style attribute so they can be restored after unmerge/delete/merge.
+    """
+    return {
+        "border": copy(cell.border) if cell.border else None,
+        "font": copy(cell.font) if cell.font else None,
+        "fill": copy(cell.fill) if cell.fill else None,
+        "number_format": cell.number_format,
+        "protection": copy(cell.protection) if cell.protection else None,
+        "alignment": copy(cell.alignment) if cell.alignment else None,
+    }
+
+
+def _restore_cell_style(cell, style: Dict[str, Any]) -> None:
+    """Restore style attributes previously captured by ``_snapshot_cell_style``."""
+    if style.get("border"):
+        cell.border = style["border"]
+    if style.get("font"):
+        cell.font = style["font"]
+    if style.get("fill"):
+        cell.fill = style["fill"]
+    if style.get("number_format"):
+        cell.number_format = style["number_format"]
+    if style.get("protection"):
+        cell.protection = style["protection"]
+    if style.get("alignment"):
+        cell.alignment = style["alignment"]
+
+
+def _shift_merged_cols_for_delete(ws, delete_from: int, delete_count: int) -> List[Tuple[str, Optional[str], Any, Optional[Dict[str, Any]], bool]]:
     """Adjust merged cell ranges after column deletion.
 
-    Returns a list of (old_range, new_range, tl_value, tl_style, tl_has_style)
-    tuples so the caller can restore top-left cell values AFTER delete_cols
+    Returns a list of (old_range, new_range, tl_value, tl_style_snapshot, tl_has_style)
+    tuples so the caller can restore top-left cell values/styles AFTER delete_cols
     (otherwise openpyxl wipes the restored cell during column deletion).
     """
     from openpyxl.worksheet.cell_range import CellRange
-    affected: List[Tuple[str, Optional[str], Any, Any, bool]] = []
+    affected: List[Tuple[str, Optional[str], Any, Optional[Dict[str, Any]], bool]] = []
     delete_end = delete_from + delete_count - 1
 
     for mr in list(ws.merged_cells.ranges):
@@ -54,9 +87,10 @@ def _shift_merged_cols_for_delete(ws, delete_from: int, delete_count: int) -> Li
                 min_col=mr.min_col - delete_count, min_row=mr.min_row,
                 max_col=mr.max_col - delete_count, max_row=mr.max_row,
             )
-            # Snapshot top-left value + style before unmerge wipes it
+            # Snapshot top-left value + full style before unmerge wipes it
             tl = ws.cell(mr.min_row, mr.min_col)
-            affected.append((str(mr), str(new), tl.value, tl._style, tl.has_style))
+            style_snap = _snapshot_cell_style(tl) if tl.has_style else None
+            affected.append((str(mr), str(new), tl.value, style_snap, tl.has_style))
         elif mr.min_col >= delete_from and mr.max_col <= delete_end:
             affected.append((str(mr), None, None, None, False))
         else:
@@ -126,11 +160,11 @@ def _adjust_day_columns(ws, days_in_month: int) -> int:
     # Delete the excess columns
     ws.delete_cols(delete_from, diff)
 
-    # Restore top-left values for merged ranges that were shifted left.
+    # Restore top-left values/styles for merged ranges that were shifted left.
     # Must happen AFTER delete_cols because openpyxl removes the restored
     # cell when the deleted column is removed.
     from openpyxl.worksheet.cell_range import CellRange
-    for old, new, tl_value, tl_style, tl_has_style in affected:
+    for old, new, tl_value, tl_style_snap, tl_has_style in affected:
         if new and (tl_has_style or tl_value is not None):
             new_cr = CellRange(new)
             key = (new_cr.min_row, new_cr.min_col)
@@ -144,8 +178,8 @@ def _adjust_day_columns(ws, days_in_month: int) -> int:
                     from ..common.col_adjust import shift_formula_cols
                     tl_value = shift_formula_cols(tl_value, delete_from, -diff, is_delete=True)
                 new_tl.value = tl_value
-            if tl_has_style and tl_style is not None:
-                new_tl._style = tl_style
+            if tl_has_style and tl_style_snap is not None:
+                _restore_cell_style(new_tl, tl_style_snap)
 
     return DAY_START_COL + days_in_month - 1
 
