@@ -186,7 +186,82 @@ def _adjust_day_columns(ws, days_in_month: int) -> int:
         # columns, so we re-create the merge for *every* adjusted range.
         ws.merge_cells(new)
 
+    # -----------------------------------------------------------------------
+    # Handle the "29-31號時數" summary column
+    # -----------------------------------------------------------------------
+    _adjust_fifth_week_summary_column(ws, days_in_month)
+
     return DAY_START_COL + days_in_month - 1
+
+
+def _adjust_fifth_week_summary_column(ws, days_in_month: int) -> None:
+    """Delete or rename the '29-31號時數' summary column based on month length.
+
+    - 28 days: delete the entire column (no days 29-31 exist).
+    - 30 days: rename header to '29-30號時數'.
+    - 31 days: keep as-is.
+    """
+    # Locate the column header that contains "29-31"
+    fifth_week_col = None
+    for c in range(1, ws.max_column + 1):
+        for r in range(1, min(ws.max_row, 15) + 1):
+            v = ws.cell(r, c).value
+            if v and isinstance(v, str) and "29-31" in v:
+                fifth_week_col = c
+                break
+        if fifth_week_col:
+            break
+
+    if not fifth_week_col:
+        return
+
+    if days_in_month <= 28:
+        # Delete the entire column
+        _delete_single_column(ws, fifth_week_col)
+    elif days_in_month == 30:
+        # Rename header: 31 -> 30
+        for r in range(1, min(ws.max_row, 15) + 1):
+            cell = ws.cell(r, fifth_week_col)
+            if cell.value and isinstance(cell.value, str):
+                cell.value = cell.value.replace("31", "30")
+
+
+def _delete_single_column(ws, col: int) -> None:
+    """Delete a single column and fix merged cells + formulas."""
+    from openpyxl.cell.cell import MergedCell
+    # Clear values in the column
+    for row in range(1, ws.max_row + 1):
+        cell = ws.cell(row, col)
+        if not isinstance(cell, MergedCell):
+            cell.value = None
+
+    # Adjust merged cells
+    affected = _shift_merged_cols_for_delete(ws, col, 1)
+
+    # Update formulas
+    update_all_formulas_for_col_change(ws, col, -1, is_delete=True)
+
+    # Delete the column
+    ws.delete_cols(col, 1)
+
+    # Restore top-left values/styles and re-merge
+    from openpyxl.worksheet.cell_range import CellRange
+    for old, new, tl_value, tl_style_snap, tl_has_style in affected:
+        if not new:
+            continue
+        new_cr = CellRange(new)
+        key = (new_cr.min_row, new_cr.min_col)
+        if key in ws._cells and type(ws._cells[key]).__name__ == "MergedCell":
+            del ws._cells[key]
+        new_tl = ws.cell(new_cr.min_row, new_cr.min_col)
+        if tl_value is not None:
+            if isinstance(tl_value, str) and tl_value.startswith("="):
+                from ..common.col_adjust import shift_formula_cols
+                tl_value = shift_formula_cols(tl_value, col, -1, is_delete=True)
+            new_tl.value = tl_value
+        if tl_has_style and tl_style_snap is not None:
+            _restore_cell_style(new_tl, tl_style_snap)
+        ws.merge_cells(new)
 
 
 # ---------------------------------------------------------------------------

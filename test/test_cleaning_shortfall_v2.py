@@ -49,13 +49,15 @@ class TestAdjustDayColumns:
         ws = template_wb.worksheets[0]
         day_end = _adjust_day_columns(ws, 28)
         assert day_end == 31  # AE
-        # Only 28 day columns
-        assert ws.max_column == 93  # original 96 - 3
+        # 28 day columns + 29-31 summary column deleted = 96 - 3 - 1 = 92
+        assert ws.max_column == 92
         # 5th week merge removed
         merges = [str(mr) for mr in ws.merged_cells.ranges]
         assert not any("AF13:AH13" in m for m in merges)
         # 4 weeks still intact
         assert ws.cell(13, 25).value == "=SUM(Y12:AE12)"
+        # 29-31號時數 summary column also removed
+        assert not any("29-31" in str(mr) for mr in ws.merged_cells.ranges)
 
     def test_28_days_clears_5th_week_values(self, template_wb):
         ws = template_wb.worksheets[0]
@@ -69,8 +71,9 @@ class TestAdjustDayColumns:
         ws = template_wb.worksheets[0]
         _adjust_day_columns(ws, 28)
         merges = [str(mr) for mr in ws.merged_cells.ranges]
-        # AI13:AM13 should shift to AF13:AJ13 (left by 3)
-        assert any("AF13:AJ13" in m for m in merges)
+        # AI13:AM13 shifts left by 4 (3 date cols + 1 summary col)
+        # After delete: AF13:AI13
+        assert any("AF13:AI13" in m for m in merges)
 
     def test_shifted_merge_preserves_border(self, template_wb):
         """Merged cells shifted left by column deletion must keep their borders."""
@@ -81,7 +84,7 @@ class TestAdjustDayColumns:
 
         _adjust_day_columns(ws, 28)
 
-        # After shift AI13:AM13 -> AF13:AJ13, check border preserved
+        # After shift AI13:AM13 -> AF13:AI13, check border preserved
         new_tl = ws.cell(13, 32)  # AF13
         assert new_tl.border.left.style == orig_border
 
