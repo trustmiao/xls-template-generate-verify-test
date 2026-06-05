@@ -35,12 +35,23 @@ _RANGE_RE = re.compile(r"([A-Z$]+)(\d+):\1(\d+)")
 # Template layout detection
 # ---------------------------------------------------------------------------
 
+_CROSS_SHEET_DATE_RE = re.compile(r"^=[^!'\"\s]+![A-Z]+\d+$")
+
+
 def _find_date_start(ws):
-    """Find the row and column of the first date cell in the worksheet."""
+    """Find the row and column of the first date cell in the worksheet.
+
+    Checks for:
+    1. Direct datetime value (e.g. 2026-03-01)
+    2. Cross-sheet reference (e.g. =早!I6) — used by multi-sheet templates
+       where subsequent sheets reference the first sheet's date anchor.
+    """
     for r in range(1, min(ws.max_row, 15) + 1):
         for c in range(1, ws.max_column + 1):
             v = ws.cell(r, c).value
             if v is not None and hasattr(v, "year"):
+                return r, c
+            if isinstance(v, str) and _CROSS_SHEET_DATE_RE.match(v):
                 return r, c
     return None, None
 
@@ -390,16 +401,28 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
     segments = data.get("segments", [])
     days_in_month = data.get("days_in_month", 31)
 
+    # Phase 0 + 1: Adjust day columns and update dates on EVERY sheet
+    for ws in wb.worksheets:
+        if ws.title == "Data":
+            continue
+        # Detect template layout (date row + first date column)
+        date_row, day_start_col = _find_date_start(ws)
+        if not day_start_col:
+            continue
+        _adjust_day_columns(ws, days_in_month)
+        _update_dates(ws, context["month"], date_row=date_row, day_start_col=day_start_col)
+
+    # -----------------------------------------------------------------------
+    # Data fill: currently only processes the first non-Data sheet.
+    # Multi-sheet templates (e.g. TY 早/中/夜) need per-shift data.
+    # -----------------------------------------------------------------------
     ws = wb.worksheets[0]
+    if ws.title == "Data" and len(wb.worksheets) > 1:
+        ws = wb.worksheets[1]
 
-    # Detect template layout (date row + first date column)
     date_row, day_start_col = _find_date_start(ws)
-
-    # Phase 0: Adjust day columns (delete excess for months < 31 days)
-    day_end_col = _adjust_day_columns(ws, days_in_month)
-
-    # Phase 1: Update dates to target month
-    _update_dates(ws, context["month"], date_row=date_row, day_start_col=day_start_col)
+    if not day_start_col:
+        return
 
     # Discover segment positions
     title_rows = _find_segment_title_rows(ws)
