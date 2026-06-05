@@ -21,11 +21,7 @@ except ImportError:
     print("Error: openpyxl is required. Install with: pip install openpyxl")
     sys.exit(1)
 
-from excel_row_ops import (
-    adjust_all_formulas,
-    safe_delete_rows,
-    adjust_conditional_formatting,
-)
+from excel_row_ops import delete_row_and_fixup
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -147,9 +143,7 @@ def process_workbook(input_path, output_path, deletions):
         # don't shift the row numbers of later deletions.
         if all_rows_to_delete:
             for row in sorted(all_rows_to_delete, reverse=True):
-                adjust_all_formulas(ws, row)
-                safe_delete_rows(ws, row, 1)
-                adjust_conditional_formatting(ws, row)
+                delete_row_and_fixup(ws, row)
 
             for region_idx, rows in deletion_log.items():
                 print(f"   ✅ Deleted {len(rows)} row(s) from region {region_idx}: "

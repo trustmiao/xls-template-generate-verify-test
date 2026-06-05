@@ -24,13 +24,7 @@ from app.engine.excel.cleaning_shortfall_v2 import (
     _adjust_day_columns,
     _update_dates,
 )
-from excel_row_ops import (
-    adjust_all_formulas,
-    safe_delete_rows,
-    fix_merged_cells,
-    adjust_print_area,
-    adjust_conditional_formatting,
-)
+from excel_row_ops import delete_row_and_fixup
 
 TEMPLATES = [
     ("东汇-保安", "templates/东汇-保安轮休表template.xlsx", [1, 2]),
@@ -85,11 +79,7 @@ def delete_second_row_of_region(ws, region):
     if row_to_delete > region['data_end']:
         return False
 
-    adjust_all_formulas(ws, row_to_delete)
-    safe_delete_rows(ws, row_to_delete, 1)
-    fix_merged_cells(ws, row_to_delete)
-    adjust_print_area(ws, row_to_delete)
-    adjust_conditional_formatting(ws, row_to_delete)
+    delete_row_and_fixup(ws, row_to_delete)
     return True
 
 

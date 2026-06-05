@@ -21,13 +21,7 @@ except ImportError:
     print("Error: openpyxl is required. Install with: pip install openpyxl")
     sys.exit(1)
 
-from excel_row_ops import (
-    adjust_all_formulas,
-    safe_delete_rows,
-    fix_merged_cells,
-    adjust_print_area,
-    adjust_conditional_formatting,
-)
+from excel_row_ops import delete_row_and_fixup
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -121,20 +115,7 @@ def process_workbook(input_path, output_path, region_index):
 
         print(f"   🗑️  Deleting row {row_to_delete} (2nd data row of region {region_index})")
 
-        # 1. Adjust formulas
-        adjust_all_formulas(ws, row_to_delete)
-
-        # 2. Physically remove the row (safe replacement for ws.delete_rows)
-        safe_delete_rows(ws, row_to_delete, 1)
-
-        # 3. Fix merged cells (direct mutation — no unmerge/merge side effects)
-        fix_merged_cells(ws, row_to_delete)
-
-        # 4. Adjust print area
-        adjust_print_area(ws, row_to_delete)
-
-        # 5. Adjust conditional formatting
-        adjust_conditional_formatting(ws, row_to_delete)
+        delete_row_and_fixup(ws, row_to_delete)
 
         print(f"   ✅ Done. Original row {row_to_delete} deleted.")
 
