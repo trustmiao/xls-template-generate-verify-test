@@ -38,7 +38,7 @@ TEMPLATES = [
     ("TY-大元保安", "templates/TY-2026.03- SG_SEC-Deploy Roster  Shortfall - template.xlsx", [1, 2]),
 ]
 
-OUT_DIR = Path("test_outputs_issue6_v2")
+OUT_DIR = Path("test_outputs_issue6")
 OUT_DIR.mkdir(exist_ok=True)
 
 # ── Region detection ──
