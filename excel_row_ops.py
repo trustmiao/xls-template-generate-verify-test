@@ -135,16 +135,24 @@ def fix_merged_cells(ws, deleted_row):
 copying the top-left cell's style to **all** cells in the merged range,
     corrupting styles.  We directly mutate :class:`MergedCellRange` objects
     in place.
+
+    Important: :class:`MergedCellRange` is hashable; mutating its bounds
+    changes its hash and breaks the internal ``set``.  We **remove** each
+    range before mutation and **re-add** it only if it survives.
     """
+    to_keep = []
     to_remove = []
     for mr in list(ws.merged_cells.ranges):
+        # Remove before mutation to avoid hash-inconsistency in the set
+        ws.merged_cells.ranges.remove(mr)
         if mr.min_row > deleted_row:
             # Only adjust row numbers (``shift`` would also move columns,
             # causing ``Invalid shift value`` when ``min_col == 1``).
             mr.min_row -= 1
             mr.max_row -= 1
+            to_keep.append(mr)
         elif mr.max_row < deleted_row:
-            pass
+            to_keep.append(mr)
         else:
             if mr.min_row == mr.max_row == deleted_row:
                 to_remove.append(mr)
@@ -152,9 +160,11 @@ copying the top-left cell's style to **all** cells in the merged range,
                 mr.max_row -= 1
                 if mr.min_row > mr.max_row:
                     to_remove.append(mr)
+                else:
+                    to_keep.append(mr)
 
-    for mr in to_remove:
-        ws.merged_cells.ranges.remove(mr)
+    for mr in to_keep:
+        ws.merged_cells.ranges.add(mr)
 
 
 # ── Print Area ──

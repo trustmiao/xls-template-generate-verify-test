@@ -20,6 +20,9 @@ from ..common.col_adjust import (
     col_num_to_letter,
 )
 
+# Safe deletion helpers (avoid openpyxl phantom-cell bugs)
+from .. import excel_row_ops, excel_column_ops
+
 DAY_START_COL = 4   # col D
 RANK_COL = 2        # col B
 NAME_COL = 3        # col C
@@ -60,88 +63,21 @@ def _find_date_start(ws):
 # Column deletion helpers
 # ---------------------------------------------------------------------------
 
-def _shift_column_dimensions_after_delete(ws, deleted_col: int) -> None:
-    """Shift column dimensions left after delete_cols.
-
-    openpyxl's delete_cols moves cell data but leaves column_dimensions
-    pointing at the old column letters, so widths get detached from
-    the shifted content.  We manually move every dimension that was
-    to the right of the deleted column one position left.
-    """
-    from openpyxl.utils import get_column_letter, column_index_from_string
-
-    # Remove the deleted column's dimension if it had one
-    deleted_letter = get_column_letter(deleted_col)
-    if deleted_letter in ws.column_dimensions:
-        del ws.column_dimensions[deleted_letter]
-
-    # Collect dimensions that need shifting
-    to_shift = []
-    for col_letter in list(ws.column_dimensions.keys()):
-        col_num = column_index_from_string(col_letter)
-        if col_num > deleted_col:
-            to_shift.append((col_letter, col_num, ws.column_dimensions[col_letter]))
-
-    # Remove old positions first
-    for col_letter, _, _ in to_shift:
-        del ws.column_dimensions[col_letter]
-
-    # Re-add at new positions
-    for col_letter, col_num, dim in to_shift:
-        new_letter = get_column_letter(col_num - 1)
-        new_num = col_num - 1
-        dim.index = new_letter
-        dim.min = new_num
-        dim.max = new_num + 1
-        ws.column_dimensions[new_letter] = dim
-
-
 def _delete_one_column(ws, col: int) -> None:
-    """Delete a single column, adjusting merged cells and formulas.
+    """Delete a single column using safe helpers (no phantom cells).
 
-    openpyxl handles cell-data shifting; we only need to:
-      1. unmerge ranges that touch the deleted column,
-      2. update formulas so column refs stay correct,
-      3. delete the column,
-      4. re-merge adjusted ranges.
+    Replaces the previous unmerge/merge + delete_cols dance with
+    excel_column_ops, which directly mutates ws._cells and fixes
+    merged-cell ranges without the style-corruption side-effect of
+    unmerge+merge.
     """
-    from openpyxl.worksheet.cell_range import CellRange
-
-    to_unmerge: List[str] = []
-    to_merge: List[str] = []
-    for mr in list(ws.merged_cells.ranges):
-        if mr.min_col > col:
-            # Entirely to the right — shift left by 1
-            new = CellRange(
-                min_col=mr.min_col - 1, min_row=mr.min_row,
-                max_col=mr.max_col - 1, max_row=mr.max_row,
-            )
-            to_unmerge.append(str(mr))
-            to_merge.append(str(new))
-        elif mr.min_col <= col <= mr.max_col:
-            # Overlaps deleted column — shrink
-            new_max = mr.max_col - 1
-            if new_max < mr.min_col:
-                to_unmerge.append(str(mr))
-            else:
-                new = CellRange(
-                    min_col=mr.min_col, min_row=mr.min_row,
-                    max_col=new_max, max_row=mr.max_row,
-                )
-                to_unmerge.append(str(mr))
-                to_merge.append(str(new))
-
-    for old in to_unmerge:
-        ws.unmerge_cells(old)
-
+    # 1. Adjust formulas (preserves existing print-area handling)
     update_all_formulas_for_col_change(ws, col, -1, is_delete=True)
-    ws.delete_cols(col, 1)
-
-    # openpyxl does NOT shift column_dimensions on delete_cols — do it manually
-    _shift_column_dimensions_after_delete(ws, col)
-
-    for new in to_merge:
-        ws.merge_cells(new)
+    # 2. Safe physical deletion — moves real Cell objects only
+    excel_column_ops.safe_delete_cols(ws, col, 1)
+    # 3. Fix merged cells and conditional formatting
+    excel_column_ops.fix_merged_cells(ws, col)
+    excel_column_ops.adjust_conditional_formatting(ws, col)
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +434,10 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
             # Remove excess template rows
             delete_from = template_data_row + n
             delete_count = template_count - n
-            ws.delete_rows(delete_from, delete_count)
+            # Delete from back to front so row numbers stay stable
+            for offset in range(delete_count - 1, -1, -1):
+                row = delete_from + offset
+                excel_row_ops.delete_row_and_fixup(ws, row)
             # Update row numbers for all subsequent sections
             for other_sb in section_bounds.values():
                 for key in ("title_row", "data_row", "end_row"):
