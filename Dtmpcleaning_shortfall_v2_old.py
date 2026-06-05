@@ -32,66 +32,65 @@ _RANGE_RE = re.compile(r"([A-Z$]+)(\d+):\1(\d+)")
 
 
 # ---------------------------------------------------------------------------
-# Template layout detection
+# Merged-cell helpers
 # ---------------------------------------------------------------------------
 
-def _find_date_start(ws):
-    """Find the row and column of the first date cell in the worksheet."""
-    for r in range(1, min(ws.max_row, 15) + 1):
-        for c in range(1, ws.max_column + 1):
-            v = ws.cell(r, c).value
-            if v is not None and hasattr(v, "year"):
-                return r, c
-    return None, None
+def _shift_merged_cols_for_delete(ws, delete_from: int, delete_count: int) -> List[Tuple[str, Optional[str], Any, Any, bool]]:
+    """Adjust merged cell ranges after column deletion.
 
-
-# ---------------------------------------------------------------------------
-# Column deletion helpers
-# ---------------------------------------------------------------------------
-
-def _delete_one_column(ws, col: int) -> None:
-    """Delete a single column, adjusting merged cells and formulas.
-
-    openpyxl handles cell-data shifting; we only need to:
-      1. unmerge ranges that touch the deleted column,
-      2. update formulas so column refs stay correct,
-      3. delete the column,
-      4. re-merge adjusted ranges.
+    Returns a list of (old_range, new_range, tl_value, tl_style, tl_has_style)
+    tuples so the caller can restore top-left cell values AFTER delete_cols
+    (otherwise openpyxl wipes the restored cell during column deletion).
     """
     from openpyxl.worksheet.cell_range import CellRange
+    affected: List[Tuple[str, Optional[str], Any, Any, bool]] = []
+    delete_end = delete_from + delete_count - 1
 
-    to_unmerge: List[str] = []
-    to_merge: List[str] = []
     for mr in list(ws.merged_cells.ranges):
-        if mr.min_col > col:
-            # Entirely to the right — shift left by 1
+        if mr.max_col < delete_from:
+            continue
+        elif mr.min_col > delete_end:
             new = CellRange(
-                min_col=mr.min_col - 1, min_row=mr.min_row,
-                max_col=mr.max_col - 1, max_row=mr.max_row,
+                min_col=mr.min_col - delete_count, min_row=mr.min_row,
+                max_col=mr.max_col - delete_count, max_row=mr.max_row,
             )
-            to_unmerge.append(str(mr))
-            to_merge.append(str(new))
-        elif mr.min_col <= col <= mr.max_col:
-            # Overlaps deleted column — shrink
-            new_max = mr.max_col - 1
-            if new_max < mr.min_col:
-                to_unmerge.append(str(mr))
-            else:
+            # Snapshot top-left value + style before unmerge wipes it
+            tl = ws.cell(mr.min_row, mr.min_col)
+            affected.append((str(mr), str(new), tl.value, tl._style, tl.has_style))
+        elif mr.min_col >= delete_from and mr.max_col <= delete_end:
+            affected.append((str(mr), None, None, None, False))
+        else:
+            if mr.min_col < delete_from:
+                new_max = mr.max_col - delete_count
+                if new_max < mr.min_col:
+                    new_max = mr.min_col
                 new = CellRange(
                     min_col=mr.min_col, min_row=mr.min_row,
                     max_col=new_max, max_row=mr.max_row,
                 )
-                to_unmerge.append(str(mr))
-                to_merge.append(str(new))
+            else:
+                new_min = delete_from
+                new_max = mr.max_col - delete_count
+                if new_max < new_min:
+                    new_max = new_min
+                new = CellRange(
+                    min_col=new_min, min_row=mr.min_row,
+                    max_col=new_max, max_row=mr.max_row,
+                )
+            # For partially-overlapping ranges the top-left stays the same,
+            # so no need to copy value/style.
+            affected.append((str(mr), str(new), None, None, False))
 
-    for old in to_unmerge:
+    # Phase 1: unmerge all old ranges first.
+    for old, new, tl_value, tl_style, tl_has_style in affected:
         ws.unmerge_cells(old)
 
-    update_all_formulas_for_col_change(ws, col, -1, is_delete=True)
-    ws.delete_cols(col, 1)
+    # Phase 2: merge new ranges.
+    for old, new, tl_value, tl_style, tl_has_style in affected:
+        if new:
+            ws.merge_cells(new)
 
-    for new in to_merge:
-        ws.merge_cells(new)
+    return affected
 
 
 # ---------------------------------------------------------------------------
@@ -101,80 +100,83 @@ def _delete_one_column(ws, col: int) -> None:
 def _adjust_day_columns(ws, days_in_month: int) -> int:
     """Adjust day columns from template's 31 days to target month days.
 
-    1. Auto-detects the first date column (works for both cleaning and
-       security templates regardless of where the date row starts).
-    2. Deletes excess day columns one-by-one from the right edge.
-    3. Handles the cleaning-template's "29-31號時數" summary column.
+    For months < 31 days, deletes excess columns from the right edge
+    (AF onwards) and adjusts merged cells + formulas.
     """
-    date_row, first_day_col = _find_date_start(ws)
-    if not first_day_col:
-        return ws.max_column
-
     if days_in_month >= TEMPLATE_DAYS:
-        return first_day_col + TEMPLATE_DAYS - 1
+        return DAY_START_COL + TEMPLATE_DAYS - 1
 
-    # Delete excess day columns from right to left (31, 30, 29).
-    # Because each deleted column is to the right of the next target,
-    # column numbers of remaining targets do not shift.
-    for day in [31, 30, 29]:
-        if days_in_month < day:
-            col = first_day_col + day - 1
-            _delete_one_column(ws, col)
+    diff = TEMPLATE_DAYS - days_in_month
+    delete_from = DAY_START_COL + days_in_month
 
-    # Handle the "29-31號時數" summary column
-    _adjust_fifth_week_summary_column(ws, days_in_month)
+    # Clear all cell values in the columns to be deleted
+    from openpyxl.cell.cell import MergedCell
+    for row in range(1, ws.max_row + 1):
+        for col in range(delete_from, delete_from + diff):
+            cell = ws.cell(row, col)
+            if not isinstance(cell, MergedCell):
+                cell.value = None
 
-    return first_day_col + days_in_month - 1
+    # Adjust merged cells before deleting (returns info needed for post-delete restore)
+    affected = _shift_merged_cols_for_delete(ws, delete_from, diff)
 
+    # Update formulas to shrink ranges ending in deleted columns
+    update_all_formulas_for_col_change(ws, delete_from, -diff, is_delete=True)
 
-def _adjust_fifth_week_summary_column(ws, days_in_month: int) -> None:
-    """Delete or rename the '29-31號時數' summary column based on month length.
+    # Delete the excess columns
+    ws.delete_cols(delete_from, diff)
 
-    - 28 days: delete the entire column (no days 29-31 exist).
-    - 30 days: rename header to '29-30號時數'.
-    - 31 days: keep as-is.
-    """
-    fifth_week_col = None
-    for c in range(1, ws.max_column + 1):
-        for r in range(1, min(ws.max_row, 15) + 1):
-            v = ws.cell(r, c).value
-            if v and isinstance(v, str) and "29-31" in v:
-                fifth_week_col = c
-                break
-        if fifth_week_col:
-            break
+    # Restore top-left values for merged ranges that were shifted left.
+    # Must happen AFTER delete_cols because openpyxl removes the restored
+    # cell when the deleted column is removed.
+    from openpyxl.worksheet.cell_range import CellRange
+    for old, new, tl_value, tl_style, tl_has_style in affected:
+        if new and (tl_has_style or tl_value is not None):
+            new_cr = CellRange(new)
+            key = (new_cr.min_row, new_cr.min_col)
+            if key in ws._cells and type(ws._cells[key]).__name__ == "MergedCell":
+                del ws._cells[key]
+            new_tl = ws.cell(new_cr.min_row, new_cr.min_col)
+            if tl_value is not None:
+                # Formulas captured before delete_cols still reference the old
+                # column letters; shift them to match the post-delete layout.
+                if isinstance(tl_value, str) and tl_value.startswith("="):
+                    from ..common.col_adjust import shift_formula_cols
+                    tl_value = shift_formula_cols(tl_value, delete_from, -diff, is_delete=True)
+                new_tl.value = tl_value
+            if tl_has_style and tl_style is not None:
+                new_tl._style = tl_style
 
-    if not fifth_week_col:
-        return
-
-    if days_in_month <= 28:
-        _delete_one_column(ws, fifth_week_col)
-    elif days_in_month == 30:
-        for r in range(1, min(ws.max_row, 15) + 1):
-            cell = ws.cell(r, fifth_week_col)
-            if cell.value and isinstance(cell.value, str):
-                cell.value = cell.value.replace("31", "30")
+    return DAY_START_COL + days_in_month - 1
 
 
 # ---------------------------------------------------------------------------
 # Date update
 # ---------------------------------------------------------------------------
 
-def _update_dates(ws, month: str, date_row: int | None = None, day_start_col: int | None = None) -> None:
+def _update_dates(ws, month: str) -> None:
     """Update date row to target month (first cell = date, rest = +1 chain)."""
-    if date_row is None or day_start_col is None:
-        date_row, day_start_col = _find_date_start(ws)
+    date_row = None
+    for r in range(1, min(ws.max_row, 15) + 1):
+        for c in range(DAY_START_COL, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if v is not None and hasattr(v, "year"):
+                date_row = r
+                break
+        if date_row:
+            break
+
     if not date_row:
         return
 
     year, month_num = int(month[:4]), int(month[5:7])
     days_in_month = calendar.monthrange(year, month_num)[1]
 
-    ws.cell(date_row, day_start_col, value=date(year, month_num, 1))
+    ws.cell(date_row, DAY_START_COL, value=date(year, month_num, 1))
 
     weekday_row = date_row + 2
     if weekday_row <= ws.max_row:
-        for c in range(day_start_col, day_start_col + days_in_month):
+        for c in range(DAY_START_COL, DAY_START_COL + days_in_month):
             v = ws.cell(weekday_row, c).value
             if isinstance(v, str) and "TEXT" in v:
                 col_letter = col_num_to_letter(c)
@@ -197,42 +199,14 @@ def _find_segment_title_rows(ws) -> Dict[str, int]:
     return out
 
 
-def _find_data_row(ws, start_row: int, end_row: int, day_start_col: int | None = None) -> int | None:
-    r"""Find the first personnel data row in a segment.
-
-    v1 templates have =SUM(D\d+:D\d+) with equal row numbers on data rows.
-    v2 templates use plain values; we fall back to rank pattern (A\d+) in col B.
-    """
-    if day_start_col is None:
-        _, day_start_col = _find_date_start(ws)
-    if not day_start_col:
-        return None
-    # v1 template: look for single-row SUM formula
+def _find_data_row(ws, start_row: int, end_row: int) -> int | None:
     for r in range(start_row + 1, end_row + 1):
-        v = ws.cell(r, day_start_col).value
+        v = ws.cell(r, DAY_START_COL).value
         if v and isinstance(v, str):
             m = _SUM_SINGLE_RE.match(v)
             if m and m.group(2) == m.group(3):
                 return int(m.group(2))
-    # v2 template: look for rank pattern in col B
-    for r in range(start_row + 1, end_row + 1):
-        b = ws.cell(r, RANK_COL).value
-        if b and isinstance(b, str) and _RANK_RE.match(b.strip()):
-            return r
     return None
-
-
-_RANK_RE = re.compile(r"^A\d+$")
-
-
-def _count_template_personnel_rows(ws, start_row: int, end_row: int) -> int:
-    """Count how many template personnel rows exist between start and end."""
-    count = 0
-    for r in range(start_row, end_row + 1):
-        b = ws.cell(r, RANK_COL).value
-        if b and isinstance(b, str) and _RANK_RE.match(b.strip()):
-            count += 1
-    return count
 
 
 def _insert_and_style(ws, insert_at: int, amount: int, source_row: int) -> None:
@@ -249,18 +223,10 @@ def _insert_and_style(ws, insert_at: int, amount: int, source_row: int) -> None:
             continue
         affected.append((str(mr), str(new)))
     for old, _ in affected:
-        try:
-            ws.unmerge_cells(old)
-        except KeyError:
-            # Range may reference cells already removed by a prior delete_rows.
-            pass
+        ws.unmerge_cells(old)
     ws.insert_rows(insert_at, amount=amount)
     for _, new in affected:
-        try:
-            ws.merge_cells(new)
-        except ValueError:
-            # Range may already exist after prior insert_rows adjustments.
-            pass
+        ws.merge_cells(new)
     _shift_print_area(ws, insert_at, amount)
     for off in range(amount):
         target_row = insert_at + off
@@ -344,16 +310,12 @@ def _copy_row_formulas(ws, source_row: int, insert_at: int, amount: int) -> None
                 ws.cell(target_row, col).value = _CELL_REF_RE.sub(_rewrite, sv)
 
 
-def _fill_data_row(ws, r: int, row_data: Dict[str, Any], days_in_month: int, day_start_col: int | None = None) -> None:
-    if day_start_col is None:
-        _, day_start_col = _find_date_start(ws)
-    if not day_start_col:
-        return
+def _fill_data_row(ws, r: int, row_data: Dict[str, Any], days_in_month: int) -> None:
     ws.cell(r, RANK_COL, value=row_data.get("rank_seq") or row_data.get("employee_no") or "")
     ws.cell(r, NAME_COL, value=row_data.get("name") or "")
     cells = {c["day"]: c for c in row_data.get("cells", [])}
     for d in range(1, days_in_month + 1):
-        col = day_start_col + d - 1
+        col = DAY_START_COL + d - 1
         c = cells.get(d)
         if not c:
             ws.cell(r, col, value="")
@@ -372,18 +334,16 @@ def _fill_data_row(ws, r: int, row_data: Dict[str, Any], days_in_month: int, day
 # Main entry
 # ---------------------------------------------------------------------------
 
-def _fetch_data(context: Dict[str, Any]) -> Dict[str, Any]:
-    """Call the API to fetch roster data.  Extracted so tests can monkey-patch."""
-    from ...api.shortfall_engine import api_shortfall_engine
-    return api_shortfall_engine(
-        shift="A", project_id=context["project_id"],
-        category_id=context["category_id"], month=context["month"],
-    )
-
-
 def run(wb: Workbook, context: Dict[str, Any]) -> None:
     """Fill the cleaning roster template (v2) for the 31-day pre-configured template."""
-    data = _fetch_data(context)
+    project_id = context["project_id"]
+    category_id = context["category_id"]
+    month = context["month"]
+
+    from ...api.shortfall_engine import api_shortfall_engine
+    data = api_shortfall_engine(
+        shift="A", project_id=project_id, category_id=category_id, month=month
+    )
     if not data.get("has_data"):
         return
 
@@ -392,14 +352,11 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
 
     ws = wb.worksheets[0]
 
-    # Detect template layout (date row + first date column)
-    date_row, day_start_col = _find_date_start(ws)
-
     # Phase 0: Adjust day columns (delete excess for months < 31 days)
     day_end_col = _adjust_day_columns(ws, days_in_month)
 
     # Phase 1: Update dates to target month
-    _update_dates(ws, context["month"], date_row=date_row, day_start_col=day_start_col)
+    _update_dates(ws, month)
 
     # Discover segment positions
     title_rows = _find_segment_title_rows(ws)
@@ -409,7 +366,7 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
     section_bounds: Dict[str, Dict[str, int]] = {}
     for i, (prefix, tr) in enumerate(sorted_titles):
         end = sorted_titles[i + 1][1] - 1 if i + 1 < len(sorted_titles) else ws.max_row
-        dr = _find_data_row(ws, tr, end, day_start_col=day_start_col)
+        dr = _find_data_row(ws, tr, end)
         if dr is not None:
             section_bounds[prefix] = {"title_row": tr, "data_row": dr, "end_row": end}
 
@@ -430,31 +387,12 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
         rows = seg["rows"]
         n = len(rows)
         template_data_row = sb["data_row"]
-        template_count = _count_template_personnel_rows(ws, template_data_row, sb["end_row"])
-
-        if n < template_count:
-            # Remove excess template rows
-            delete_from = template_data_row + n
-            delete_count = template_count - n
-            ws.delete_rows(delete_from, delete_count)
-            # Update row numbers for all subsequent sections
-            for other_sb in section_bounds.values():
-                for key in ("title_row", "data_row", "end_row"):
-                    if other_sb[key] > delete_from:
-                        other_sb[key] -= delete_count
-        elif n > template_count:
-            # Insert additional rows
-            insert_at = template_data_row + template_count
-            insert_count = n - template_count
-            _insert_and_style(ws, insert_at, insert_count, source_row=template_data_row)
-            _shift_formulas(ws, insert_at, insert_count)
-            _expand_range(ws, template_data_row, template_data_row + n - 1)
-            _copy_row_formulas(ws, template_data_row, insert_at, insert_count)
-            # Update row numbers for all subsequent sections
-            for other_sb in section_bounds.values():
-                for key in ("title_row", "data_row", "end_row"):
-                    if other_sb[key] >= insert_at:
-                        other_sb[key] += insert_count
-
+        end_row = template_data_row + n - 1
+        if n > 1:
+            insert_at = template_data_row + 1
+            _insert_and_style(ws, insert_at, n - 1, source_row=template_data_row)
+            _shift_formulas(ws, insert_at, n - 1)
+            _expand_range(ws, template_data_row, end_row)
+            _copy_row_formulas(ws, template_data_row, insert_at, n - 1)
         for idx, row_data in enumerate(rows):
-            _fill_data_row(ws, template_data_row + idx, row_data, days_in_month, day_start_col=day_start_col)
+            _fill_data_row(ws, template_data_row + idx, row_data, days_in_month)
