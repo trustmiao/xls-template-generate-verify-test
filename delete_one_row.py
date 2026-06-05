@@ -181,13 +181,27 @@ def safe_delete_rows(ws, idx, amount=1):
                 cell.row = r
                 del ws._cells[(source_r, col)]
 
-    # Update row dimensions
+    # Update row dimensions (height + style + other attrs)
     for r in range(idx, max_row + 1):
         source_r = r + amount
+        dst_rd = ws.row_dimensions[r]
         if source_r in ws.row_dimensions:
-            ws.row_dimensions[r].height = ws.row_dimensions[source_r].height
-        elif r in ws.row_dimensions:
-            ws.row_dimensions[r].height = None
+            src_rd = ws.row_dimensions[source_r]
+            dst_rd.height = src_rd.height
+            if src_rd._style is not None:
+                from copy import copy
+                dst_rd._style = copy(src_rd._style)
+            else:
+                dst_rd._style = None
+            dst_rd.hidden = src_rd.hidden
+            dst_rd.outline_level = src_rd.outline_level
+            dst_rd.collapsed = src_rd.collapsed
+        else:
+            dst_rd.height = None
+            dst_rd._style = None
+            dst_rd.hidden = False
+            dst_rd.outline_level = 0
+            dst_rd.collapsed = False
 
     # Update current_row
     ws._current_row = max(row for row, col in ws._cells.keys()) if ws._cells else 0
@@ -206,26 +220,34 @@ def adjust_print_area(ws, deleted_row):
 
 def fix_merged_cells(ws, deleted_row):
     """
-    openpyxl's delete_rows does NOT update merged cell ranges.
-    We must save them before deletion, then rebuild with adjusted row numbers.
+    Adjust merged cell ranges after a row deletion WITHOUT unmerge+merge.
+
+    openpyxl's unmerge_cells + merge_cells has a side effect of copying
+    the top-left cell's style to ALL merged cells, which corrupts styles
+    (e.g. fills backgrounds white or overwrites custom colours).
+    We directly mutate MergedCellRange objects in place.
     """
-    # Save all current merged ranges as strings
-    merged_ranges = [str(mc) for mc in ws.merged_cells.ranges]
+    to_remove = []
+    for mr in list(ws.merged_cells.ranges):
+        if mr.min_row > deleted_row:
+            # Entirely below the deleted row — shift up by 1
+            mr.shift(-1, 0)
+        elif mr.max_row < deleted_row:
+            # Entirely above — no change
+            pass
+        else:
+            # deleted_row is inside or at the boundary of this range
+            if mr.min_row == mr.max_row == deleted_row:
+                # Single-row range that is completely deleted
+                to_remove.append(mr)
+            else:
+                # Reduce the range by 1 row at the bottom
+                mr.max_row -= 1
+                if mr.min_row > mr.max_row:
+                    to_remove.append(mr)
 
-    # Remove all merged cells (using original range strings)
-    for mc_str in merged_ranges:
-        try:
-            ws.unmerge_cells(mc_str)
-        except Exception:
-            pass  # may already be invalid after delete_rows
-
-    # Re-add with adjusted row numbers
-    for mc_str in merged_ranges:
-        adjusted = adjust_merged_range(mc_str, deleted_row)
-        try:
-            ws.merge_cells(adjusted)
-        except Exception as e:
-            print(f"      ⚠️  Could not merge {adjusted}: {e}")
+    for mr in to_remove:
+        ws.merged_cells.ranges.remove(mr)
 
 
 def adjust_all_formulas(ws, deleted_row):
@@ -265,25 +287,14 @@ def process_workbook(input_path, output_path, region_index):
 
         print(f"   🗑️  Deleting row {row_to_delete} (2nd data row of region {region_index})")
 
-        # 1. Save merged cells & adjust formulas
-        merged_ranges = [str(mc) for mc in ws.merged_cells.ranges]
+        # 1. Adjust formulas
         adjust_all_formulas(ws, row_to_delete)
 
         # 2. Physically remove the row (safe replacement for ws.delete_rows)
         safe_delete_rows(ws, row_to_delete, 1)
 
-        # 3. Fix merged cells (safe_delete_rows does NOT update them)
-        for mc_str in merged_ranges:
-            try:
-                ws.unmerge_cells(mc_str)
-            except Exception:
-                pass
-        for mc_str in merged_ranges:
-            adjusted = adjust_merged_range(mc_str, row_to_delete)
-            try:
-                ws.merge_cells(adjusted)
-            except Exception as e:
-                print(f"      ⚠️  Could not merge {adjusted}: {e}")
+        # 3. Fix merged cells (direct mutation — no unmerge/merge side effects)
+        fix_merged_cells(ws, row_to_delete)
 
         # 4. Adjust print area
         adjust_print_area(ws, row_to_delete)

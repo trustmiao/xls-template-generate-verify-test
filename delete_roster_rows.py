@@ -173,10 +173,24 @@ def safe_delete_rows(ws, idx, amount=1):
 
     for r in range(idx, max_row + 1):
         source_r = r + amount
+        dst_rd = ws.row_dimensions[r]
         if source_r in ws.row_dimensions:
-            ws.row_dimensions[r].height = ws.row_dimensions[source_r].height
-        elif r in ws.row_dimensions:
-            ws.row_dimensions[r].height = None
+            src_rd = ws.row_dimensions[source_r]
+            dst_rd.height = src_rd.height
+            if src_rd._style is not None:
+                from copy import copy
+                dst_rd._style = copy(src_rd._style)
+            else:
+                dst_rd._style = None
+            dst_rd.hidden = src_rd.hidden
+            dst_rd.outline_level = src_rd.outline_level
+            dst_rd.collapsed = src_rd.collapsed
+        else:
+            dst_rd.height = None
+            dst_rd._style = None
+            dst_rd.hidden = False
+            dst_rd.outline_level = 0
+            dst_rd.collapsed = False
 
     ws._current_row = max(row for row, col in ws._cells.keys()) if ws._cells else 0
 
