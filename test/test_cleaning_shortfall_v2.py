@@ -328,3 +328,69 @@ class TestRowAdjustment:
             assert ws.cell(pr, 2).value == f"A{i+1}"
         nxt = ws.cell(seg3[-1] + 1, 2).value
         assert nxt is None or "每天工作總時數" in str(nxt)
+
+
+class TestThreeTemplatesFebApr:
+    """Cross-template validation: Feb (28) and Apr (30) day-column adjustment."""
+
+    @pytest.fixture
+    def ty_wb(self):
+        return load_workbook(
+            r"D:\claude\claude_hk\backend\app\engine\templates\TY-2026.03- SG_SEC-Deploy Roster  Shortfall - template.xlsx",
+            data_only=False,
+        )
+
+    def _check_date_continuity(self, ws, days, label):
+        """Assert every day column has a value and the next col is non-date."""
+        date_row, first_col = _find_date_start(ws)
+        assert first_col, f"{label}: no date row found"
+        for c in range(first_col, first_col + days):
+            v = ws.cell(date_row, c).value
+            assert v is not None, (
+                f"{label} col {c} ({__import__('openpyxl').utils.get_column_letter(c)})"
+                f" row {date_row} is None"
+            )
+        next_col = first_col + days
+        v_next = ws.cell(date_row, next_col).value
+        assert not (v_next and hasattr(v_next, "year")), (
+            f"{label} col {next_col} still looks like a date: {v_next}"
+        )
+
+    # --- 东汇保安 ---
+    def test_security_feb28(self, security_wb):
+        ws = security_wb.worksheets[0]
+        _adjust_day_columns(ws, 28)
+        _update_dates(ws, "2026-02")
+        self._check_date_continuity(ws, 28, "东汇保安 Feb28")
+
+    def test_security_apr30(self, security_wb):
+        ws = security_wb.worksheets[0]
+        _adjust_day_columns(ws, 30)
+        _update_dates(ws, "2026-04")
+        self._check_date_continuity(ws, 30, "东汇保安 Apr30")
+
+    # --- 东汇保洁 ---
+    def test_cleaning_feb28(self, template_wb):
+        ws = template_wb.worksheets[0]
+        _adjust_day_columns(ws, 28)
+        _update_dates(ws, "2026-02")
+        self._check_date_continuity(ws, 28, "东汇保洁 Feb28")
+
+    def test_cleaning_apr30(self, template_wb):
+        ws = template_wb.worksheets[0]
+        _adjust_day_columns(ws, 30)
+        _update_dates(ws, "2026-04")
+        self._check_date_continuity(ws, 30, "东汇保洁 Apr30")
+
+    # --- TY 大元保安 (first sheet = 早) ---
+    def test_ty_feb28(self, ty_wb):
+        ws = ty_wb.worksheets[0]
+        _adjust_day_columns(ws, 28)
+        _update_dates(ws, "2026-02")
+        self._check_date_continuity(ws, 28, "TY Feb28")
+
+    def test_ty_apr30(self, ty_wb):
+        ws = ty_wb.worksheets[0]
+        _adjust_day_columns(ws, 30)
+        _update_dates(ws, "2026-04")
+        self._check_date_continuity(ws, 30, "TY Apr30")
