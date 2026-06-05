@@ -60,6 +60,42 @@ def _find_date_start(ws):
 # Column deletion helpers
 # ---------------------------------------------------------------------------
 
+def _shift_column_dimensions_after_delete(ws, deleted_col: int) -> None:
+    """Shift column dimensions left after delete_cols.
+
+    openpyxl's delete_cols moves cell data but leaves column_dimensions
+    pointing at the old column letters, so widths get detached from
+    the shifted content.  We manually move every dimension that was
+    to the right of the deleted column one position left.
+    """
+    from openpyxl.utils import get_column_letter, column_index_from_string
+
+    # Remove the deleted column's dimension if it had one
+    deleted_letter = get_column_letter(deleted_col)
+    if deleted_letter in ws.column_dimensions:
+        del ws.column_dimensions[deleted_letter]
+
+    # Collect dimensions that need shifting
+    to_shift = []
+    for col_letter in list(ws.column_dimensions.keys()):
+        col_num = column_index_from_string(col_letter)
+        if col_num > deleted_col:
+            to_shift.append((col_letter, col_num, ws.column_dimensions[col_letter]))
+
+    # Remove old positions first
+    for col_letter, _, _ in to_shift:
+        del ws.column_dimensions[col_letter]
+
+    # Re-add at new positions
+    for col_letter, col_num, dim in to_shift:
+        new_letter = get_column_letter(col_num - 1)
+        new_num = col_num - 1
+        dim.index = new_letter
+        dim.min = new_num
+        dim.max = new_num + 1
+        ws.column_dimensions[new_letter] = dim
+
+
 def _delete_one_column(ws, col: int) -> None:
     """Delete a single column, adjusting merged cells and formulas.
 
@@ -100,6 +136,9 @@ def _delete_one_column(ws, col: int) -> None:
 
     update_all_formulas_for_col_change(ws, col, -1, is_delete=True)
     ws.delete_cols(col, 1)
+
+    # openpyxl does NOT shift column_dimensions on delete_cols — do it manually
+    _shift_column_dimensions_after_delete(ws, col)
 
     for new in to_merge:
         ws.merge_cells(new)
