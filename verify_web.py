@@ -31,6 +31,7 @@ from app.engine.html.web_roster import (
     run,
     _color_to_hex,
     _get_conditional_bg_color,
+    _is_default_fill,
     _get_print_area_bounds,
     _find_date_start,
     _find_weekday_row,
@@ -179,7 +180,7 @@ def get_excel_cell_info(ws, row: int, col: int) -> dict:
         style["font_bold"] = cell.font.bold
         style["font_color"] = _color_to_hex(cell.font.color)
 
-    if cell.fill:
+    if cell.fill and not _is_default_fill(cell):
         style["bg_color"] = _color_to_hex(cell.fill.fgColor)
         if not style.get("bg_color") and hasattr(cell.fill, "start_color") and cell.fill.start_color:
             style["bg_color"] = _color_to_hex(cell.fill.start_color)

@@ -141,11 +141,13 @@ def _html_escape(s: str) -> str:
 
 
 # Office default theme colour mapping (index → RRGGBB)
+# Note: theme=0 is treated as white/transparent in conditional format dxfs
+# (Excel uses it as a 'no-fill' sentinel in many dxf definitions).
 _THEME_COLORS = {
-    0: "000000",   # dk1
-    1: "FFFFFF",   # lt1
-    2: "44546A",   # dk2
-    3: "E7E6E6",   # lt2
+    0: "FFFFFF",   # lt1 (used as default/transparent in dxfs)
+    1: "000000",   # dk1
+    2: "E7E6E6",   # lt2
+    3: "44546A",   # dk2
     4: "4472C4",   # accent1
     5: "ED7D31",   # accent2
     6: "A5A5A5",   # accent3
@@ -352,7 +354,7 @@ def _adjust_number_formats(ws, day_start_col: int, days_in_month: int) -> None:
 
 # ── Conditional formatting helpers ──
 
-_CF_SEARCH_RE = re.compile(r'SEARCH\s*\(\s*"([^"]+)"')
+_CF_SEARCH_RE = re.compile(r'SEARCH\s*\(\s*"([^"]+)"\s*,\s*([A-Z]+\d+)\s*\)')
 
 
 def _parse_cf_formula_value(formula_list):
@@ -366,13 +368,18 @@ def _parse_cf_formula_value(formula_list):
 
 
 def _parse_cf_contains_text(formula_list):
-    """Extract search text from containsText formula."""
+    """Extract (search_text, ref_cell) from containsText formula.
+
+    Returns (search_text, ref_cell) where ref_cell is the cell
+    referenced in the SEARCH function (e.g. 'H20').
+    If ref_cell is None, the formula doesn't contain a SEARCH.
+    """
     if not formula_list or not formula_list[0]:
-        return None
+        return None, None
     m = _CF_SEARCH_RE.search(str(formula_list[0]))
     if m:
-        return m.group(1)
-    return None
+        return m.group(1), m.group(2)
+    return None, None
 
 
 def _cell_in_cf_range(sqref, row: int, col: int) -> bool:
@@ -385,8 +392,8 @@ def _cell_in_cf_range(sqref, row: int, col: int) -> bool:
     return False
 
 
-def _cell_matches_cf_rule(cell_value, rule) -> bool:
-    """Check if a cell value matches a conditional formatting rule."""
+def _cell_matches_cf_rule(ws, row: int, col: int, rule) -> bool:
+    """Check if a cell (row, col) matches a conditional formatting rule."""
     rule_type = rule.type
     formula = rule.formula
 
@@ -396,6 +403,7 @@ def _cell_matches_cf_rule(cell_value, rule) -> bool:
         if expected is None:
             return False
 
+        cell_value = ws.cell(row, col).value
         cell_str = str(cell_value) if cell_value is not None else ""
 
         if operator == "equal":
@@ -419,11 +427,22 @@ def _cell_matches_cf_rule(cell_value, rule) -> bool:
         return False
 
     elif rule_type == "containsText":
-        search_text = _parse_cf_contains_text(formula)
+        search_text, ref_cell = _parse_cf_contains_text(formula)
         if search_text is None:
             return False
-        cell_str = str(cell_value) if cell_value is not None else ""
-        return search_text in cell_str
+
+        # Read the value from the referenced cell (or current cell if no ref)
+        if ref_cell:
+            from openpyxl.utils.cell import coordinate_from_string, column_index_from_string
+            c_letter, r_num = coordinate_from_string(ref_cell)
+            ref_col = column_index_from_string(c_letter)
+            ref_row = r_num
+            check_value = ws.cell(ref_row, ref_col).value
+        else:
+            check_value = ws.cell(row, col).value
+
+        check_str = str(check_value) if check_value is not None else ""
+        return search_text in check_str
 
     # Other types not supported yet
     return False
@@ -439,8 +458,7 @@ def _get_conditional_bg_color(ws, row: int, col: int) -> str | None:
             continue
 
         for rule in cf.rules:
-            cell_value = ws.cell(row, col).value
-            if _cell_matches_cf_rule(cell_value, rule):
+            if _cell_matches_cf_rule(ws, row, col, rule):
                 priority = getattr(rule, "priority", 999999)
                 matching_rules.append((priority, rule))
 
@@ -468,6 +486,29 @@ def _get_conditional_bg_color(ws, row: int, col: int) -> str | None:
 
 # ── HTML export helpers ──
 
+def _is_default_fill(cell) -> bool:
+    """Detect Excel's default fill pattern which means 'no fill'.
+
+    Excel stores unset background as:
+      patternType='solid', fgColor=theme=0, bgColor=indexed=64(auto)
+    This must NOT be rendered as a colour.
+    """
+    if not cell.fill:
+        return True
+    if cell.fill.patternType != "solid":
+        return False
+    fg = cell.fill.fgColor
+    bg = cell.fill.bgColor
+    return (
+        fg is not None
+        and fg.type == "theme"
+        and fg.theme == 0
+        and bg is not None
+        and bg.type == "indexed"
+        and bg.value == 64
+    )
+
+
 def _cell_to_css(cell, conditional_bg: str | None = None) -> str:
     """Convert openpyxl cell styles to a CSS style string."""
     styles: List[str] = []
@@ -491,7 +532,7 @@ def _cell_to_css(cell, conditional_bg: str | None = None) -> str:
     # ── Fill (background) ──
     # Conditional formatting bg takes precedence over normal fill
     bg_color = conditional_bg
-    if not bg_color and cell.fill:
+    if not bg_color and cell.fill and not _is_default_fill(cell):
         # Prefer fgColor; fallback to start_color for older openpyxl
         if cell.fill.fgColor:
             bg_color = _color_to_hex(cell.fill.fgColor)
