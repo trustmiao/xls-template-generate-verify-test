@@ -726,14 +726,18 @@ def sheet_to_html(ws, month: str, value_ws=None) -> str:
     ]
 
     # ── Column widths ──
+    # Excel default column width (in characters)
+    _DEFAULT_COL_WIDTH = 8.43
+
     for c in visible_cols:
         letter = col_num_to_letter(c)
-        width = ws.column_dimensions[letter].width if letter in ws.column_dimensions else None
-        if width:
-            px = int(width * 7)
-            html_parts.append(f'<col style="width:{px}px">')
+        dim = ws.column_dimensions.get(letter)
+        if dim and dim.width:
+            width = dim.width
         else:
-            html_parts.append('<col>')
+            width = _DEFAULT_COL_WIDTH
+        px = int(width * 7)
+        html_parts.append(f'<col style="width:{px}px">')
 
     for r in visible_rows:
         # Row height
