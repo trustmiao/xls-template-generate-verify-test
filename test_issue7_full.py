@@ -25,11 +25,13 @@ from app.engine.common.data_source import build_context
 OUT_DIR = Path("test_outputs_issue7")
 OUT_DIR.mkdir(exist_ok=True)
 
+_TPL_DIR = Path(__file__).parent / "templates"
+
 # ── Test combinations ──
 COMBINATIONS = [
     {
         "label": "东汇邨-保洁-2026-02",
-        "template": "app/engine/templates/东汇-保洁轮休表_template.xlsx",
+        "template": _TPL_DIR / "东汇-保洁轮休表_template.xlsx",
         "project_id": 2,
         "category_id": 2,
         "month": "2026-02",
@@ -38,7 +40,7 @@ COMBINATIONS = [
     },
     {
         "label": "东汇邨-保洁-2026-03",
-        "template": "app/engine/templates/东汇-保洁轮休表_template.xlsx",
+        "template": _TPL_DIR / "东汇-保洁轮休表_template.xlsx",
         "project_id": 2,
         "category_id": 2,
         "month": "2026-03",
@@ -47,7 +49,7 @@ COMBINATIONS = [
     },
     {
         "label": "东汇邨-保安-2026-02",
-        "template": "app/engine/templates/东汇-保安轮休表template.xlsx",
+        "template": _TPL_DIR / "东汇-保安轮休表template.xlsx",
         "project_id": 2,
         "category_id": 3,
         "month": "2026-02",
@@ -56,7 +58,7 @@ COMBINATIONS = [
     },
     {
         "label": "东汇邨-保安-2026-03",
-        "template": "app/engine/templates/东汇-保安轮休表template.xlsx",
+        "template": _TPL_DIR / "东汇-保安轮休表template.xlsx",
         "project_id": 2,
         "category_id": 3,
         "month": "2026-03",
@@ -65,7 +67,7 @@ COMBINATIONS = [
     },
     {
         "label": "大元邨-保安-2026-02",
-        "template": "app/engine/templates/TY-2026.03- SG_SEC-Deploy Roster  Shortfall - template.xlsx",
+        "template": _TPL_DIR / "TY-2026.03- SG_SEC-Deploy Roster  Shortfall - template.xlsx",
         "project_id": 1,
         "category_id": 1,
         "month": "2026-02",
@@ -74,7 +76,7 @@ COMBINATIONS = [
     },
     {
         "label": "大元邨-保安-2026-03",
-        "template": "app/engine/templates/TY-2026.03- SG_SEC-Deploy Roster  Shortfall - template.xlsx",
+        "template": _TPL_DIR / "TY-2026.03- SG_SEC-Deploy Roster  Shortfall - template.xlsx",
         "project_id": 1,
         "category_id": 1,
         "month": "2026-03",

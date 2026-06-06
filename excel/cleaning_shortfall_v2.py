@@ -208,7 +208,7 @@ def _find_data_row(ws, start_row: int, end_row: int, day_start_col: int | None =
     return None
 
 
-_RANK_RE = re.compile(r"^A\d+$")
+_RANK_RE = re.compile(r"^[A-Z]{1,2}\d+$")
 
 
 def _count_template_personnel_rows(ws, start_row: int, end_row: int) -> int:
@@ -367,14 +367,19 @@ def _shift_from_sheet_name(sheet_name: str) -> str:
 
 
 def _fetch_data(context: Dict[str, Any], shift: str) -> Dict[str, Any]:
-    """Call the API to fetch roster data for a specific shift.
+    """Fetch roster data for a specific shift.
 
-    Extracted so tests can monkey-patch.
+    Bypasses api_shortfall_engine (which imports fastapi → starlette →
+    stdlib 'html') to avoid the package-name clash with app/engine/html/.
+    Delegates directly to html.shortfall.run which uses the same underlying
+    load_pages + render_sheet pipeline.
     """
-    from ...api.shortfall_engine import api_shortfall_engine
-    return api_shortfall_engine(
-        shift=shift, project_id=context["project_id"],
-        category_id=context["category_id"], month=context["month"],
+    from ..html.shortfall import run as shortfall_run
+    return shortfall_run(
+        shift=shift,
+        project_id=context["project_id"],
+        category_id=context["category_id"],
+        month=context["month"],
     )
 
 
@@ -421,11 +426,14 @@ def run(wb: Workbook, context: Dict[str, Any]) -> None:
             continue
 
         if not data.get("has_data"):
-            # No data — clear all data rows
+            # No data — clear all data rows (skip MergedCell which is read-only)
             for prefix, sb in section_bounds.items():
                 for r in range(sb["data_row"], sb["end_row"] + 1):
                     for col in range(1, ws.max_column + 1):
-                        ws.cell(r, col).value = ""
+                        cell = ws.cell(r, col)
+                        # MergedCell (sub-cells inside a merge range) is read-only
+                        if hasattr(cell, "value") and type(cell).__name__ != "MergedCell":
+                            cell.value = ""
             continue
 
         segments = data.get("segments", [])
