@@ -22,12 +22,12 @@ from openpyxl import load_workbook
 import sys
 sys.path.insert(0, r"D:\claude\claude_hk\backend")
 
-from app.engine.excel.web_roster import (
+from app.engine.html.web_roster import (
     _detect_roster_regions,
     _shrink_region,
     _adjust_number_formats,
     workbook_to_html,
-    run as engine_run,
+    _process_workbook as engine_run,
 )
 
 TEMPLATES = [
@@ -40,23 +40,35 @@ OUT_DIR = Path("test_outputs_web_roster")
 OUT_DIR.mkdir(exist_ok=True)
 
 # ── Mock data (simulating api_shortfall_engine response) ──
-MOCK_SEGMENTS = [
+# ── Config A: 2人 / 3人 / 4人 ──
+MOCK_SEGMENTS_2_3_4 = [
     {
-        "title": "1. 保安主管出勤時數",
+        "title": "1. 第一欄出勤時數",
         "rows": [
-            {"rank_seq": "M01", "employee_no": "0001234", "name": "張三", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 29)]},
-            {"rank_seq": "M02", "employee_no": "0005678", "name": "李四", "cells": [{"day": d, "code": "8" if d % 2 else "RD", "value": "8" if d % 2 else "RD"} for d in range(1, 29)]},
+            {"rank_seq": "M01", "employee_no": "0001234", "name": "張三", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 32)]},
+            {"rank_seq": "M02", "employee_no": "0005678", "name": "李四", "cells": [{"day": d, "code": "8" if d % 2 else "RD", "value": "8" if d % 2 else "RD"} for d in range(1, 32)]},
         ],
     },
     {
-        "title": "2. 保安員出勤時數",
+        "title": "2. 第二欄出勤時數",
         "rows": [
-            {"rank_seq": "D01", "employee_no": "0009012", "name": "王五", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 29)]},
-            {"rank_seq": "D02", "employee_no": "0003456", "name": "趙六", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 29)]},
-            {"rank_seq": "D03", "employee_no": "0007890", "name": "陳七", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 29)]},
+            {"rank_seq": "D01", "employee_no": "0009012", "name": "王五", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 32)]},
+            {"rank_seq": "D02", "employee_no": "0003456", "name": "趙六", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 32)]},
+            {"rank_seq": "D03", "employee_no": "0007890", "name": "陳七", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 32)]},
+        ],
+    },
+    {
+        "title": "3. 第三欄出勤時數",
+        "rows": [
+            {"rank_seq": "S01", "employee_no": "0001111", "name": "劉八", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 32)]},
+            {"rank_seq": "S02", "employee_no": "0002222", "name": "黃九", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 32)]},
+            {"rank_seq": "S03", "employee_no": "0003333", "name": "林十", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 32)]},
+            {"rank_seq": "S04", "employee_no": "0004444", "name": "吳十一", "cells": [{"day": d, "code": "8", "value": "8"} for d in range(1, 32)]},
         ],
     },
 ]
+
+MOCK_SEGMENTS = MOCK_SEGMENTS_2_3_4
 
 MOCK_DATA = {
     "has_data": True,
@@ -77,7 +89,7 @@ def test_date_update():
     ws = wb["早"]
 
     # Patch fetch_data
-    import app.engine.excel.web_roster as wr
+    import app.engine.html.web_roster as wr
     orig_fetch = wr._fetch_data
     wr._fetch_data = mock_fetch_data
 
@@ -87,7 +99,7 @@ def test_date_update():
         wr._fetch_data = orig_fetch
 
     # Check first date cell
-    from app.engine.excel.cleaning_shortfall_v2 import _find_date_start
+    from app.engine.html.web_roster import _find_date_start
     date_row, day_start_col = _find_date_start(ws)
     first_date = ws.cell(date_row, day_start_col).value
     assert first_date == date(2026, 2, 1), f"Expected 2026-02-01, got {first_date}"
@@ -110,7 +122,7 @@ def test_column_deletion():
     wb = load_workbook(TEMPLATES[0][1], data_only=False, keep_links=False)
     ws = wb["早"]
 
-    import app.engine.excel.web_roster as wr
+    import app.engine.html.web_roster as wr
     orig_fetch = wr._fetch_data
     wr._fetch_data = mock_fetch_data
 
@@ -119,7 +131,7 @@ def test_column_deletion():
     finally:
         wr._fetch_data = orig_fetch
 
-    from app.engine.excel.cleaning_shortfall_v2 import _find_date_start
+    from app.engine.html.web_roster import _find_date_start
     date_row, day_start_col = _find_date_start(ws)
     days_in_month = 28
 
@@ -154,7 +166,7 @@ def test_row_shrink():
     wb = load_workbook(TEMPLATES[0][1], data_only=False, keep_links=False)
     ws = wb["早"]
 
-    import app.engine.excel.web_roster as wr
+    import app.engine.html.web_roster as wr
     orig_fetch = wr._fetch_data
     wr._fetch_data = mock_fetch_data
 
@@ -192,7 +204,7 @@ def test_number_formats():
     wb = load_workbook(TEMPLATES[0][1], data_only=False, keep_links=False)
     ws = wb["早"]
 
-    import app.engine.excel.web_roster as wr
+    import app.engine.html.web_roster as wr
     orig_fetch = wr._fetch_data
     wr._fetch_data = mock_fetch_data
 
@@ -201,7 +213,7 @@ def test_number_formats():
     finally:
         wr._fetch_data = orig_fetch
 
-    from app.engine.excel.cleaning_shortfall_v2 import _find_date_start
+    from app.engine.html.web_roster import _find_date_start
     date_row, day_start_col = _find_date_start(ws)
 
     # Check that numeric cells have correct number format
@@ -223,7 +235,7 @@ def test_html_export():
     print("\n[Test 6] HTML export")
     wb = load_workbook(TEMPLATES[0][1], data_only=False, keep_links=False)
 
-    import app.engine.excel.web_roster as wr
+    import app.engine.html.web_roster as wr
     orig_fetch = wr._fetch_data
     wr._fetch_data = mock_fetch_data
 
@@ -274,7 +286,7 @@ def test_all_templates():
         for month in ["2026-02", "2026-04"]:
             wb = load_workbook(path, data_only=False, keep_links=False)
 
-            import app.engine.excel.web_roster as wr
+            import app.engine.html.web_roster as wr
             orig_fetch = wr._fetch_data
             wr._fetch_data = mock_fetch_data
 
@@ -283,12 +295,7 @@ def test_all_templates():
             finally:
                 wr._fetch_data = orig_fetch
 
-            # Save Excel
-            xlsx_path = OUT_DIR / f"{month}_{name}_web.xlsx"
-            wb.save(str(xlsx_path))
-            print(f"  💾 Excel: {xlsx_path}")
-
-            # Save HTML
+            # Save HTML only (web_roster is HTML-only engine)
             html = workbook_to_html(wb, month)
             html_path = OUT_DIR / f"{month}_{name}_web.html"
             html_path.write_text(html, encoding="utf-8")

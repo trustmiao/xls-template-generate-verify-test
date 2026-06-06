@@ -20,7 +20,6 @@ EXCEL_ENGINES: Dict[str, Callable] = {
     "cleaning_roster": excel.cleaning_roster_run,
     "cleaning_shortfall": excel.cleaning_shortfall_run,
     "cleaning_shortfall_v2": excel.cleaning_shortfall_v2_run,
-    "web_roster": excel.web_roster_run,
 }
 
 # Legacy alias for backward compat
