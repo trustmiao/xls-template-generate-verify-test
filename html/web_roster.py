@@ -140,6 +140,42 @@ def _html_escape(s: str) -> str:
     )
 
 
+# Office default theme colour mapping (index → RRGGBB)
+_THEME_COLORS = {
+    0: "000000",   # dk1
+    1: "FFFFFF",   # lt1
+    2: "44546A",   # dk2
+    3: "E7E6E6",   # lt2
+    4: "4472C4",   # accent1
+    5: "ED7D31",   # accent2
+    6: "A5A5A5",   # accent3
+    7: "FFC000",   # accent4
+    8: "5B9BD5",   # accent5
+    9: "70AD47",   # accent6
+}
+
+
+def _apply_tint(rgb_hex: str, tint: float) -> str:
+    """Apply Excel tint to an RRGGBB colour."""
+    r = int(rgb_hex[0:2], 16)
+    g = int(rgb_hex[2:4], 16)
+    b = int(rgb_hex[4:6], 16)
+
+    if tint > 0:
+        r = int(r + (255 - r) * tint)
+        g = int(g + (255 - g) * tint)
+        b = int(b + (255 - b) * tint)
+    elif tint < 0:
+        r = int(r * (1 + tint))
+        g = int(g * (1 + tint))
+        b = int(b * (1 + tint))
+
+    r = max(0, min(255, r))
+    g = max(0, min(255, g))
+    b = max(0, min(255, b))
+    return f"{r:02X}{g:02X}{b:02X}"
+
+
 def _color_to_hex(color) -> str | None:
     """Convert openpyxl Color to CSS #RRGGBB string.
 
@@ -175,8 +211,15 @@ def _color_to_hex(color) -> str | None:
         if len(raw) == 6:
             return f"#{raw}"
 
-    # Theme colours – simplified fallback (would need workbook theme lookup)
+    # Theme colours
     if getattr(color, "type", None) == "theme":
+        theme_idx = getattr(color, "theme", None)
+        if theme_idx is not None and theme_idx in _THEME_COLORS:
+            base = _THEME_COLORS[theme_idx]
+            tint = getattr(color, "tint", 0.0) or 0.0
+            if tint:
+                return f"#{_apply_tint(base, tint)}"
+            return f"#{base}"
         return None
 
     return None
@@ -307,9 +350,125 @@ def _adjust_number_formats(ws, day_start_col: int, days_in_month: int) -> None:
                     cell.number_format = "0.00"
 
 
+# ── Conditional formatting helpers ──
+
+_CF_SEARCH_RE = re.compile(r'SEARCH\s*\(\s*"([^"]+)"')
+
+
+def _parse_cf_formula_value(formula_list):
+    """Parse cellIs formula value, e.g. ['"NC"'] -> 'NC'."""
+    if not formula_list or not formula_list[0]:
+        return None
+    val = str(formula_list[0]).strip()
+    if val.startswith('"') and val.endswith('"'):
+        return val[1:-1]
+    return val
+
+
+def _parse_cf_contains_text(formula_list):
+    """Extract search text from containsText formula."""
+    if not formula_list or not formula_list[0]:
+        return None
+    m = _CF_SEARCH_RE.search(str(formula_list[0]))
+    if m:
+        return m.group(1)
+    return None
+
+
+def _cell_in_cf_range(sqref, row: int, col: int) -> bool:
+    """Check if a cell (row, col) is in a conditional formatting sqref string."""
+    sqref_str = str(sqref) if not isinstance(sqref, str) else sqref
+    for part in sqref_str.split():
+        min_col, min_row, max_col, max_row = range_boundaries(part)
+        if min_row <= row <= max_row and min_col <= col <= max_col:
+            return True
+    return False
+
+
+def _cell_matches_cf_rule(cell_value, rule) -> bool:
+    """Check if a cell value matches a conditional formatting rule."""
+    rule_type = rule.type
+    formula = rule.formula
+
+    if rule_type == "cellIs":
+        operator = getattr(rule, "operator", None)
+        expected = _parse_cf_formula_value(formula)
+        if expected is None:
+            return False
+
+        cell_str = str(cell_value) if cell_value is not None else ""
+
+        if operator == "equal":
+            return cell_str == expected
+        elif operator == "notEqual":
+            return cell_str != expected
+        elif operator in ("greaterThan", "lessThan", "greaterThanOrEqual", "lessThanOrEqual"):
+            try:
+                cell_num = float(cell_value) if cell_value is not None else 0
+                expected_num = float(expected)
+                if operator == "greaterThan":
+                    return cell_num > expected_num
+                elif operator == "lessThan":
+                    return cell_num < expected_num
+                elif operator == "greaterThanOrEqual":
+                    return cell_num >= expected_num
+                elif operator == "lessThanOrEqual":
+                    return cell_num <= expected_num
+            except (ValueError, TypeError):
+                return False
+        return False
+
+    elif rule_type == "containsText":
+        search_text = _parse_cf_contains_text(formula)
+        if search_text is None:
+            return False
+        cell_str = str(cell_value) if cell_value is not None else ""
+        return search_text in cell_str
+
+    # Other types not supported yet
+    return False
+
+
+def _get_conditional_bg_color(ws, row: int, col: int) -> str | None:
+    """Get the conditional formatting background colour for a cell."""
+    matching_rules = []
+
+    for cf in ws.conditional_formatting:
+        # Check if cell is in the conditional formatting range
+        if not _cell_in_cf_range(cf.sqref, row, col):
+            continue
+
+        for rule in cf.rules:
+            cell_value = ws.cell(row, col).value
+            if _cell_matches_cf_rule(cell_value, rule):
+                priority = getattr(rule, "priority", 999999)
+                matching_rules.append((priority, rule))
+
+    if not matching_rules:
+        return None
+
+    # Sort by priority (lower = higher priority)
+    matching_rules.sort(key=lambda x: x[0])
+    _, rule = matching_rules[0]
+
+    if not rule.dxf or not rule.dxf.fill:
+        return None
+
+    # Conditional format dxfs often use bgColor for the background
+    bg_color = None
+    if rule.dxf.fill.bgColor:
+        bg_color = _color_to_hex(rule.dxf.fill.bgColor)
+
+    # Fallback to fgColor
+    if not bg_color and rule.dxf.fill.fgColor:
+        bg_color = _color_to_hex(rule.dxf.fill.fgColor)
+
+    return bg_color
+
+
 # ── HTML export helpers ──
 
-def _cell_to_css(cell) -> str:
+def _cell_to_css(cell, conditional_bg: str | None = None) -> str:
     """Convert openpyxl cell styles to a CSS style string."""
     styles: List[str] = []
 
@@ -330,15 +489,16 @@ def _cell_to_css(cell) -> str:
             styles.append(f"color:{color_hex}")
 
     # ── Fill (background) ──
-    if cell.fill:
+    # Conditional formatting bg takes precedence over normal fill
+    bg_color = conditional_bg
+    if not bg_color and cell.fill:
         # Prefer fgColor; fallback to start_color for older openpyxl
-        fill_color = None
         if cell.fill.fgColor:
-            fill_color = _color_to_hex(cell.fill.fgColor)
-        if not fill_color and hasattr(cell.fill, "start_color") and cell.fill.start_color:
-            fill_color = _color_to_hex(cell.fill.start_color)
-        if fill_color:
-            styles.append(f"background-color:{fill_color}")
+            bg_color = _color_to_hex(cell.fill.fgColor)
+        if not bg_color and hasattr(cell.fill, "start_color") and cell.fill.start_color:
+            bg_color = _color_to_hex(cell.fill.start_color)
+    if bg_color:
+        styles.append(f"background-color:{bg_color}")
 
     # ── Border ──
     if cell.border:
@@ -589,7 +749,8 @@ def sheet_to_html(ws, month: str, value_ws=None) -> str:
                 continue
 
             cell = ws.cell(r, c)
-            style = _cell_to_css(cell)
+            cf_bg = _get_conditional_bg_color(ws, r, c)
+            style = _cell_to_css(cell, conditional_bg=cf_bg)
             value = cell.value
 
             # Prefer pre-computed value from data_only workbook

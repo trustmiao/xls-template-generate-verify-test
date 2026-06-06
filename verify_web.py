@@ -30,6 +30,7 @@ sys.path.insert(0, r"D:\claude\claude_hk\backend")
 from app.engine.html.web_roster import (
     run,
     _color_to_hex,
+    _get_conditional_bg_color,
     _get_print_area_bounds,
     _find_date_start,
     _find_weekday_row,
@@ -182,6 +183,9 @@ def get_excel_cell_info(ws, row: int, col: int) -> dict:
         style["bg_color"] = _color_to_hex(cell.fill.fgColor)
         if not style.get("bg_color") and hasattr(cell.fill, "start_color") and cell.fill.start_color:
             style["bg_color"] = _color_to_hex(cell.fill.start_color)
+
+    # Conditional formatting background colour
+    style["cf_bg_color"] = _get_conditional_bg_color(ws, row, col)
 
     if cell.border:
         for side in ["top", "bottom", "left", "right"]:
@@ -419,7 +423,8 @@ def verify_sheet(html_data: dict, ws, value_ws=None) -> list[dict]:
 
             # ── Background color check ──
             excel_info = get_excel_cell_info(ws, excel_r, excel_c)
-            excel_bg = excel_info["style"].get("bg_color")
+            # Conditional format bg takes precedence over normal fill
+            excel_bg = excel_info["style"].get("cf_bg_color") or excel_info["style"].get("bg_color")
             html_style = parse_css_style(html_cell["style"])
             html_bg = html_style.get("background-color")
 
