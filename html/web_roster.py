@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.styles.colors import COLOR_INDEX
+from openpyxl.utils import range_boundaries
 
 from ..common.data_source import resolve_template
 from ..common.shift_info import _get_holidays_for_month, WEEKDAY_CH
@@ -406,145 +407,233 @@ def _find_weekday_row(ws, date_row):
     return None
 
 
-def workbook_to_html(wb: Workbook, month: str, value_wb: Workbook | None = None) -> str:
-    """Convert an openpyxl workbook to a single HTML string.
+def _get_print_area_bounds(ws) -> tuple[int, int, int, int] | None:
+    """解析 print_area，返回 (min_col, min_row, max_col, max_row)。
+
+    如果没有设置 print_area，返回 None（表示使用整张表）。
+    """
+    pa = ws.print_area
+    if not pa:
+        return None
+    # openpyxl 可能返回字符串或列表
+    if isinstance(pa, list):
+        pa = pa[0]
+    if "!" in pa:
+        pa = pa.split("!")[1]
+    return range_boundaries(pa)
+
+
+def _is_row_visible(ws, row: int, bounds: tuple[int, int, int, int] | None) -> bool:
+    """行是否在 print_area 内且未隐藏。"""
+    if bounds:
+        _, min_row, _, max_row = bounds
+        if not (min_row <= row <= max_row):
+            return False
+    return not ws.row_dimensions[row].hidden
+
+
+def _is_col_visible(ws, col: int, bounds: tuple[int, int, int, int] | None) -> bool:
+    """列是否在 print_area 内且未隐藏。"""
+    if bounds:
+        min_col, _, max_col, _ = bounds
+        if not (min_col <= col <= max_col):
+            return False
+    letter = col_num_to_letter(col)
+    dim = ws.column_dimensions.get(letter)
+    return not (dim and dim.hidden)
+
+
+def _visible_rows_cols(ws, bounds: tuple[int, int, int, int] | None):
+    """返回可见的行列列表和映射。
+
+    Returns:
+        visible_rows: List[int] — 可见行号（1-based，已排序）
+        visible_cols: List[int] — 可见列号（1-based，已排序）
+        row_map: Dict[int, int] — Excel 行号 → HTML 行索引（1-based）
+        col_map: Dict[int, int] — Excel 列号 → HTML 列索引（1-based）
+    """
+    if bounds:
+        min_col, min_row, max_col, max_row = bounds
+    else:
+        min_col, min_row, max_col, max_row = 1, 1, ws.max_column, ws.max_row
+
+    visible_rows = [
+        r for r in range(min_row, max_row + 1)
+        if not ws.row_dimensions[r].hidden
+    ]
+    visible_cols = [
+        c for c in range(min_col, max_col + 1)
+        if not _is_col_hidden(ws, c)
+    ]
+
+    row_map = {r: i + 1 for i, r in enumerate(visible_rows)}
+    col_map = {c: i + 1 for i, c in enumerate(visible_cols)}
+
+    return visible_rows, visible_cols, row_map, col_map
+
+
+def _is_col_hidden(ws, col: int) -> bool:
+    """检查列是否隐藏。"""
+    letter = col_num_to_letter(col)
+    dim = ws.column_dimensions.get(letter)
+    return bool(dim and dim.hidden)
+
+
+def sheet_to_html(ws, month: str, value_ws=None) -> str:
+    """将单个 worksheet 转换为 HTML，只导出 print_area 内的可见行列。
 
     Args:
-        wb: Workbook loaded with data_only=False (styles, formulas, merged cells).
+        ws: Worksheet loaded with data_only=False (styles, formulas, merged cells).
         month: Target month (YYYY-MM) for holiday/ weekday rendering.
-        value_wb: Optional workbook loaded with data_only=True; its cell
+        value_ws: Optional worksheet loaded with data_only=True; its cell
             values (pre-computed formula results) are preferred over the
-            raw formula strings in ``wb``.
+            raw formula strings in ``ws``.
 
     Features:
-      - Renders every non-Data sheet as a separate <table>
-      - Preserves merged cells (rowspan/colspan)
-      - Preserves cell styles (font, colour, border, alignment)
-      - Date row shows day number + public-holiday badge
-      - Weekday row shows Chinese weekday characters
-      - Formula cells display their computed values
+      - 只渲染 print_area 范围内的单元格
+      - 跳过隐藏的行和列
+      - 保留合并单元格（rowspan/colspan 根据可见行列重新计算）
+      - 保留单元格样式（字体、颜色、边框、对齐）
+      - 公式单元格显示计算值
     """
     year, month_num = int(month[:4]), int(month[5:7])
     days_in_month = calendar.monthrange(year, month_num)[1]
     holidays = _get_holidays_for_month(year, month_num)
 
-    # Build a map from sheet title → value_ws for fast lookup
-    value_ws_map: Dict[str, Any] = {}
-    if value_wb:
-        for vws in value_wb.worksheets:
-            value_ws_map[vws.title] = vws
+    bounds = _get_print_area_bounds(ws)
+    visible_rows, visible_cols, row_map, col_map = _visible_rows_cols(ws, bounds)
+
+    if not visible_rows or not visible_cols:
+        return ""
+
+    # ── 处理合并单元格 ──
+    # 只保留在 print_area 内且包含可见单元格的合并区域
+    merged_map: Dict[tuple[int, int], tuple[int, int]] = {}
+    merged_covered: set[tuple[int, int]] = set()
+
+    for mr in ws.merged_cells.ranges:
+        # 检查合并区域是否与 print_area 相交
+        if bounds:
+            min_col, min_row, max_col, max_row = bounds
+            if mr.max_row < min_row or mr.min_row > max_row:
+                continue
+            if mr.max_col < min_col or mr.min_col > max_col:
+                continue
+
+        # 计算可见范围内的行列
+        visible_in_merge_rows = [
+            r for r in range(mr.min_row, mr.max_row + 1)
+            if r in row_map
+        ]
+        visible_in_merge_cols = [
+            c for c in range(mr.min_col, mr.max_col + 1)
+            if c in col_map
+        ]
+
+        if not visible_in_merge_rows or not visible_in_merge_cols:
+            continue
+
+        leader_row = visible_in_merge_rows[0]
+        leader_col = visible_in_merge_cols[0]
+        rs = len(visible_in_merge_rows)
+        cs = len(visible_in_merge_cols)
+
+        merged_map[(leader_row, leader_col)] = (rs, cs)
+        for r in visible_in_merge_rows:
+            for c in visible_in_merge_cols:
+                if (r, c) != (leader_row, leader_col):
+                    merged_covered.add((r, c))
+
+    date_row, day_start_col = _find_date_start(ws)
+    weekday_row = _find_weekday_row(ws, date_row) if date_row else None
 
     html_parts = [
         "<!DOCTYPE html>",
         '<html>',
         '<head>',
         '<meta charset="utf-8">',
-        "<title>Web Roster</title>",
+        f"<title>{_html_escape(ws.title)}</title>",
         "<style>",
         "body { font-family: Arial, 'Microsoft JhengHei', sans-serif; margin: 20px; }",
-        "table { border-collapse: collapse; margin-bottom: 30px; table-layout: fixed; }",
-        "td, th { padding: 2px 4px; white-space: nowrap; overflow: hidden; }",
+        "table { border-collapse: collapse; table-layout: fixed; width: 100%; }",
+        "td, th { padding: 2px 4px; white-space: nowrap; overflow: hidden; box-sizing: border-box; }",
         '.holiday { color: #c00; font-size: 8pt; font-weight: bold; }',
         "</style>",
         "</head>",
         "<body>",
+        f'<h2>{_html_escape(ws.title)}</h2>',
+        "<table>",
     ]
 
-    for ws in wb.worksheets:
-        if ws.title == "Data":
-            continue
+    # ── Column widths ──
+    for c in visible_cols:
+        letter = col_num_to_letter(c)
+        width = ws.column_dimensions[letter].width if letter in ws.column_dimensions else None
+        if width:
+            px = int(width * 7)
+            html_parts.append(f'<col style="width:{px}px">')
+        else:
+            html_parts.append('<col>')
 
-        value_ws = value_ws_map.get(ws.title)
+    for r in visible_rows:
+        # Row height
+        row_height = ws.row_dimensions[r].height if r in ws.row_dimensions else None
+        row_style = ""
+        if row_height:
+            px = int(row_height * 1.33)
+            row_style = f' style="height:{px}px"'
+        html_parts.append(f"<tr{row_style}>")
 
-        html_parts.append(f'<h2>{_html_escape(ws.title)}</h2>')
-        html_parts.append("<table>")
+        for c in visible_cols:
+            if (r, c) in merged_covered:
+                continue
 
-        # ── Column widths (via <col> tags) ──
-        for col in range(1, ws.max_column + 1):
-            letter = col_num_to_letter(col)
-            width = ws.column_dimensions[letter].width if letter in ws.column_dimensions else None
-            if width:
-                # Excel width → px (approximate: ~7 px per Excel unit)
-                px = int(width * 7)
-                html_parts.append(f'<col style="width:{px}px">')
-            else:
-                html_parts.append('<col>')
+            cell = ws.cell(r, c)
+            style = _cell_to_css(cell)
+            value = cell.value
 
-        date_row, day_start_col = _find_date_start(ws)
-        weekday_row = _find_weekday_row(ws, date_row) if date_row else None
+            # Prefer pre-computed value from data_only workbook
+            computed_value = None
+            if value_ws:
+                try:
+                    computed_value = value_ws.cell(r, c).value
+                except Exception:
+                    pass
 
-        merged_covered: set[tuple[int, int]] = set()
-        merged_map: Dict[tuple[int, int], tuple[int, int]] = {}
-        for mr in ws.merged_cells.ranges:
-            for r in range(mr.min_row, mr.max_row + 1):
-                for c in range(mr.min_col, mr.max_col + 1):
-                    if (r, c) != (mr.min_row, mr.min_col):
-                        merged_covered.add((r, c))
-            merged_map[(mr.min_row, mr.min_col)] = (
-                mr.max_row - mr.min_row + 1,
-                mr.max_col - mr.min_col + 1,
-            )
-
-        for row in range(1, ws.max_row + 1):
-            # Row height
-            row_height = ws.row_dimensions[row].height if row in ws.row_dimensions else None
-            row_style = ""
-            if row_height:
-                px = int(row_height * 1.33)  # Excel point → px (approximate)
-                row_style = f' style="height:{px}px"'
-            html_parts.append(f"<tr{row_style}>")
-
-            for col in range(1, ws.max_column + 1):
-                if (row, col) in merged_covered:
-                    continue
-
-                cell = ws.cell(row, col)
-                style = _cell_to_css(cell)
-                value = cell.value
-
-                # Prefer pre-computed value from data_only workbook
-                computed_value = None
-                if value_ws:
-                    try:
-                        computed_value = value_ws.cell(row, col).value
-                    except Exception:
-                        pass
-
-                if row == date_row and day_start_col and col >= day_start_col:
-                    day = col - day_start_col + 1
-                    if 1 <= day <= days_in_month:
-                        val_str = str(day)
-                        if day in holidays:
-                            val_str += (
-                                f'<br><span class="holiday">'
-                                f'{_html_escape(holidays[day])}</span>'
-                            )
-                    else:
-                        val_str = _format_cell_value(value, computed_value)
-                elif row == weekday_row and day_start_col and col >= day_start_col:
-                    day = col - day_start_col + 1
-                    if 1 <= day <= days_in_month:
-                        val_str = WEEKDAY_CH[date(year, month_num, day).weekday()]
-                    else:
-                        val_str = _format_cell_value(value, computed_value)
+            if r == date_row and day_start_col and c >= day_start_col:
+                day = c - day_start_col + 1
+                if 1 <= day <= days_in_month:
+                    val_str = str(day)
+                    if day in holidays:
+                        val_str += (
+                            f'<br><span class="holiday">'
+                            f'{_html_escape(holidays[day])}</span>'
+                        )
                 else:
                     val_str = _format_cell_value(value, computed_value)
+            elif r == weekday_row and day_start_col and c >= day_start_col:
+                day = c - day_start_col + 1
+                if 1 <= day <= days_in_month:
+                    val_str = WEEKDAY_CH[date(year, month_num, day).weekday()]
+                else:
+                    val_str = _format_cell_value(value, computed_value)
+            else:
+                val_str = _format_cell_value(value, computed_value)
 
-                attrs = ""
-                if (row, col) in merged_map:
-                    rs, cs = merged_map[(row, col)]
-                    if rs > 1:
-                        attrs += f' rowspan="{rs}"'
-                    if cs > 1:
-                        attrs += f' colspan="{cs}"'
-                if style:
-                    attrs += f' style="{style}"'
+            attrs = ""
+            if (r, c) in merged_map:
+                rs, cs = merged_map[(r, c)]
+                if rs > 1:
+                    attrs += f' rowspan="{rs}"'
+                if cs > 1:
+                    attrs += f' colspan="{cs}"'
+            if style:
+                attrs += f' style="{style}"'
 
-                html_parts.append(f"<td{attrs}>{val_str}</td>")
-            html_parts.append("</tr>")
+            html_parts.append(f"<td{attrs}>{val_str}</td>")
+        html_parts.append("</tr>")
 
-        html_parts.append("</table>")
-
+    html_parts.append("</table>")
     html_parts.append("</body></html>")
     return "\n".join(html_parts)
 
@@ -705,10 +794,21 @@ def run(
         _adjust_day_columns(vws, days_in_month)
         _update_dates(vws, effective_month)
 
-    html = workbook_to_html(wb, effective_month, value_wb=wb_values)
+    # 每个 sheet 生成独立的 HTML
+    sheets_html: Dict[str, str] = {}
+    for ws in wb.worksheets:
+        if ws.title == "Data":
+            continue
+        value_ws = None
+        if wb_values:
+            for vws in wb_values.worksheets:
+                if vws.title == ws.title:
+                    value_ws = vws
+                    break
+        sheets_html[ws.title] = sheet_to_html(ws, effective_month, value_ws=value_ws)
 
     return {
-        "html": html,
+        "sheets": sheets_html,
         "month": effective_month,
         "template_path": str(rel_path) if rel_path else "",
         "_wb": wb,           # internal: processed workbook for testing
