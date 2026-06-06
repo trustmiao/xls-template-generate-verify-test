@@ -26,6 +26,8 @@ from app.engine.html.web_roster import (
     _detect_roster_regions,
     _shrink_region,
     _adjust_number_formats,
+    _adjust_day_columns,
+    _update_dates,
     workbook_to_html,
     _process_workbook as engine_run,
 )
@@ -234,6 +236,7 @@ def test_html_export():
     """Test 6: HTML export with holiday badges."""
     print("\n[Test 6] HTML export")
     wb = load_workbook(TEMPLATES[0][1], data_only=False, keep_links=False)
+    wb_values = load_workbook(TEMPLATES[0][1], data_only=True, keep_links=False)
 
     import app.engine.html.web_roster as wr
     orig_fetch = wr._fetch_data
@@ -244,7 +247,14 @@ def test_html_export():
     finally:
         wr._fetch_data = orig_fetch
 
-    html = workbook_to_html(wb, "2026-02")
+    # Keep value workbook columns in sync
+    for vws in wb_values.worksheets:
+        if vws.title == "Data":
+            continue
+        _adjust_day_columns(vws, 28)
+        _update_dates(vws, "2026-02")
+
+    html = workbook_to_html(wb, "2026-02", value_wb=wb_values)
 
     # Save for manual inspection
     html_path = OUT_DIR / "TY-大元保安_2026-02.html"
@@ -274,10 +284,17 @@ def test_html_export():
     assert found_weekday, "HTML should contain Chinese weekday characters"
     print("  ✓ Chinese weekday characters rendered")
 
+    # Check no formula text residue
+    assert "=YEAR(" not in html, "Formula text should not appear in HTML"
+    assert "=MONTH(" not in html, "Formula text should not appear in HTML"
+    assert "=SUBSTITUTE(" not in html, "Formula text should not appear in HTML"
+    print("  ✓ No formula text residue")
+
 
 def test_all_templates():
     """Run engine on all templates and save outputs."""
     print("\n[Test 7] All templates (Feb + Apr)")
+    import calendar
     for name, path in TEMPLATES:
         if not Path(path).exists():
             print(f"  ⚠ Skipping {name} — template not found at {path}")
@@ -285,6 +302,7 @@ def test_all_templates():
 
         for month in ["2026-02", "2026-04"]:
             wb = load_workbook(path, data_only=False, keep_links=False)
+            wb_values = load_workbook(path, data_only=True, keep_links=False)
 
             import app.engine.html.web_roster as wr
             orig_fetch = wr._fetch_data
@@ -295,8 +313,17 @@ def test_all_templates():
             finally:
                 wr._fetch_data = orig_fetch
 
+            # Keep value workbook columns in sync
+            year, month_num = int(month[:4]), int(month[5:7])
+            days_in_month = calendar.monthrange(year, month_num)[1]
+            for vws in wb_values.worksheets:
+                if vws.title == "Data":
+                    continue
+                _adjust_day_columns(vws, days_in_month)
+                _update_dates(vws, month)
+
             # Save HTML only (web_roster is HTML-only engine)
-            html = workbook_to_html(wb, month)
+            html = workbook_to_html(wb, month, value_wb=wb_values)
             html_path = OUT_DIR / f"{month}_{name}_web.html"
             html_path.write_text(html, encoding="utf-8")
             print(f"  💾 HTML:  {html_path}")

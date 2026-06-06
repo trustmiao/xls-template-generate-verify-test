@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import MergedCell
+from openpyxl.styles.colors import COLOR_INDEX
 
 from ..common.data_source import resolve_template
 from ..common.shift_info import _get_holidays_for_month, WEEKDAY_CH
@@ -138,6 +139,74 @@ def _html_escape(s: str) -> str:
     )
 
 
+def _color_to_hex(color) -> str | None:
+    """Convert openpyxl Color to CSS #RRGGBB string.
+
+    Handles indexed, rgb, and theme color types.  Returns None for
+    transparent / auto / unresolvable colours.
+    """
+    if color is None:
+        return None
+
+    # Indexed colours (most common in xlsx templates)
+    if getattr(color, "type", None) == "indexed":
+        idx = color.value
+        # idx == 64 means "auto" – use default (None)
+        if idx is not None and 0 <= idx < len(COLOR_INDEX):
+            rgb = COLOR_INDEX[idx]
+            if rgb and isinstance(rgb, str) and len(rgb) == 8 and rgb != "00000000":
+                return f"#{rgb[2:]}"
+        return None
+
+    # Direct RGB (8-char AARRGGBB or 6-char RRGGBB)
+    raw = None
+    if getattr(color, "type", None) == "rgb":
+        raw = color.value
+    elif getattr(color, "rgb", None):
+        raw = color.rgb
+        # openpyxl rgb descriptor may raise on read; guard against error text
+        if isinstance(raw, str) and "must be of type" in raw:
+            raw = None
+    if raw and isinstance(raw, str):
+        raw = raw.strip()
+        if len(raw) == 8 and raw != "00000000":
+            return f"#{raw[2:]}"
+        if len(raw) == 6:
+            return f"#{raw}"
+
+    # Theme colours – simplified fallback (would need workbook theme lookup)
+    if getattr(color, "type", None) == "theme":
+        return None
+
+    return None
+
+
+# Excel border style → CSS width mapping
+_BORDER_WIDTH_MAP = {
+    "hair": "0.5px",
+    "thin": "1px",
+    "medium": "2px",
+    "thick": "3px",
+    "double": "3px",
+    "dashed": "1px",
+    "dotted": "1px",
+    "mediumDashDot": "2px",
+    "mediumDashDotDot": "2px",
+    "slantDashDot": "1px",
+}
+
+
+# Excel border style → CSS border-style
+_BORDER_STYLE_MAP = {
+    "double": "double",
+    "dashed": "dashed",
+    "dotted": "dotted",
+    "mediumDashDot": "dashed",
+    "mediumDashDotDot": "dotted",
+    "slantDashDot": "dashed",
+}
+
+
 def _shift_from_sheet_name(sheet_name: str) -> str:
     mapping = {"早": "A", "中": "B", "夜": "C"}
     return mapping.get(sheet_name, "A")
@@ -240,12 +309,10 @@ def _adjust_number_formats(ws, day_start_col: int, days_in_month: int) -> None:
 # ── HTML export helpers ──
 
 def _cell_to_css(cell) -> str:
+    """Convert openpyxl cell styles to a CSS style string."""
     styles: List[str] = []
 
-    def _rgb_str(rgb) -> str:
-        s = str(rgb) if rgb is not None else ""
-        return s if len(s) == 8 else ""
-
+    # ── Font ──
     if cell.font:
         if cell.font.name:
             styles.append(f"font-family:{cell.font.name}")
@@ -253,14 +320,26 @@ def _cell_to_css(cell) -> str:
             styles.append(f"font-size:{cell.font.size}pt")
         if cell.font.bold:
             styles.append("font-weight:bold")
-        if cell.font.color and cell.font.color.rgb:
-            rgb = _rgb_str(cell.font.color.rgb)
-            if rgb and rgb != "00000000":
-                styles.append(f"color:#{rgb[2:]}")
-    if cell.fill and cell.fill.fgColor and cell.fill.fgColor.rgb:
-        rgb = _rgb_str(cell.fill.fgColor.rgb)
-        if rgb and rgb != "00000000":
-            styles.append(f"background-color:#{rgb[2:]}")
+        if cell.font.italic:
+            styles.append("font-style:italic")
+        if cell.font.underline and cell.font.underline != "none":
+            styles.append("text-decoration:underline")
+        color_hex = _color_to_hex(cell.font.color)
+        if color_hex:
+            styles.append(f"color:{color_hex}")
+
+    # ── Fill (background) ──
+    if cell.fill:
+        # Prefer fgColor; fallback to start_color for older openpyxl
+        fill_color = None
+        if cell.fill.fgColor:
+            fill_color = _color_to_hex(cell.fill.fgColor)
+        if not fill_color and hasattr(cell.fill, "start_color") and cell.fill.start_color:
+            fill_color = _color_to_hex(cell.fill.start_color)
+        if fill_color:
+            styles.append(f"background-color:{fill_color}")
+
+    # ── Border ──
     if cell.border:
         for side_name, side in [
             ("top", cell.border.top),
@@ -269,23 +348,52 @@ def _cell_to_css(cell) -> str:
             ("right", cell.border.right),
         ]:
             if side and side.style:
-                color = _rgb_str(side.color.rgb) if side.color and side.color.rgb else "000000"
-                if len(color) == 8:
-                    color = color[2:]
-                styles.append(f"border-{side_name}:1px solid #{color}")
+                width = _BORDER_WIDTH_MAP.get(side.style, "1px")
+                bstyle = _BORDER_STYLE_MAP.get(side.style, "solid")
+                color_hex = _color_to_hex(side.color)
+                color_str = color_hex if color_hex else "#000000"
+                styles.append(f"border-{side_name}:{width} {bstyle} {color_str}")
+
+    # ── Alignment ──
     if cell.alignment:
         if cell.alignment.horizontal:
             styles.append(f"text-align:{cell.alignment.horizontal}")
         if cell.alignment.vertical:
-            styles.append(f"vertical-align:{cell.alignment.vertical}")
+            v = cell.alignment.vertical
+            # openpyxl uses "center" for both; CSS needs explicit mapping
+            if v == "center":
+                styles.append("vertical-align:middle")
+            else:
+                styles.append(f"vertical-align:{v}")
+        # Text wrap
+        if cell.alignment.wrapText:
+            styles.append("white-space:normal;word-wrap:break-word")
+
     return ";".join(styles)
 
 
-def _format_cell_value(value) -> str:
+def _format_cell_value(value, computed_value=None) -> str:
+    """Format a cell value for HTML display.
+
+    Args:
+        value: The raw cell value (may be a formula string).
+        computed_value: The computed/cached value from data_only=True load.
+            If provided and not None, it takes precedence over ``value``.
+    """
+    # Prefer the pre-computed (data_only) value when available
+    if computed_value is not None:
+        value = computed_value
+
     if value is None:
         return ""
     if hasattr(value, "year"):
+        # date/datetime – show day number for date rows
         return str(value.day)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Format numbers consistently with Excel
+        if isinstance(value, int) or value == int(value):
+            return str(int(value))
+        return f"{value:.2f}"
     return _html_escape(str(value))
 
 
@@ -298,19 +406,33 @@ def _find_weekday_row(ws, date_row):
     return None
 
 
-def workbook_to_html(wb: Workbook, month: str) -> str:
+def workbook_to_html(wb: Workbook, month: str, value_wb: Workbook | None = None) -> str:
     """Convert an openpyxl workbook to a single HTML string.
+
+    Args:
+        wb: Workbook loaded with data_only=False (styles, formulas, merged cells).
+        month: Target month (YYYY-MM) for holiday/ weekday rendering.
+        value_wb: Optional workbook loaded with data_only=True; its cell
+            values (pre-computed formula results) are preferred over the
+            raw formula strings in ``wb``.
 
     Features:
       - Renders every non-Data sheet as a separate <table>
       - Preserves merged cells (rowspan/colspan)
-      - Preserves basic cell styles (font, colour, border, alignment)
+      - Preserves cell styles (font, colour, border, alignment)
       - Date row shows day number + public-holiday badge
       - Weekday row shows Chinese weekday characters
+      - Formula cells display their computed values
     """
     year, month_num = int(month[:4]), int(month[5:7])
     days_in_month = calendar.monthrange(year, month_num)[1]
     holidays = _get_holidays_for_month(year, month_num)
+
+    # Build a map from sheet title → value_ws for fast lookup
+    value_ws_map: Dict[str, Any] = {}
+    if value_wb:
+        for vws in value_wb.worksheets:
+            value_ws_map[vws.title] = vws
 
     html_parts = [
         "<!DOCTYPE html>",
@@ -320,8 +442,8 @@ def workbook_to_html(wb: Workbook, month: str) -> str:
         "<title>Web Roster</title>",
         "<style>",
         "body { font-family: Arial, 'Microsoft JhengHei', sans-serif; margin: 20px; }",
-        "table { border-collapse: collapse; margin-bottom: 30px; }",
-        "td, th { padding: 3px 6px; border: 1px solid #ccc; white-space: nowrap; }",
+        "table { border-collapse: collapse; margin-bottom: 30px; table-layout: fixed; }",
+        "td, th { padding: 2px 4px; white-space: nowrap; overflow: hidden; }",
         '.holiday { color: #c00; font-size: 8pt; font-weight: bold; }',
         "</style>",
         "</head>",
@@ -332,8 +454,21 @@ def workbook_to_html(wb: Workbook, month: str) -> str:
         if ws.title == "Data":
             continue
 
+        value_ws = value_ws_map.get(ws.title)
+
         html_parts.append(f'<h2>{_html_escape(ws.title)}</h2>')
         html_parts.append("<table>")
+
+        # ── Column widths (via <col> tags) ──
+        for col in range(1, ws.max_column + 1):
+            letter = col_num_to_letter(col)
+            width = ws.column_dimensions[letter].width if letter in ws.column_dimensions else None
+            if width:
+                # Excel width → px (approximate: ~7 px per Excel unit)
+                px = int(width * 7)
+                html_parts.append(f'<col style="width:{px}px">')
+            else:
+                html_parts.append('<col>')
 
         date_row, day_start_col = _find_date_start(ws)
         weekday_row = _find_weekday_row(ws, date_row) if date_row else None
@@ -351,7 +486,14 @@ def workbook_to_html(wb: Workbook, month: str) -> str:
             )
 
         for row in range(1, ws.max_row + 1):
-            html_parts.append("<tr>")
+            # Row height
+            row_height = ws.row_dimensions[row].height if row in ws.row_dimensions else None
+            row_style = ""
+            if row_height:
+                px = int(row_height * 1.33)  # Excel point → px (approximate)
+                row_style = f' style="height:{px}px"'
+            html_parts.append(f"<tr{row_style}>")
+
             for col in range(1, ws.max_column + 1):
                 if (row, col) in merged_covered:
                     continue
@@ -359,6 +501,14 @@ def workbook_to_html(wb: Workbook, month: str) -> str:
                 cell = ws.cell(row, col)
                 style = _cell_to_css(cell)
                 value = cell.value
+
+                # Prefer pre-computed value from data_only workbook
+                computed_value = None
+                if value_ws:
+                    try:
+                        computed_value = value_ws.cell(row, col).value
+                    except Exception:
+                        pass
 
                 if row == date_row and day_start_col and col >= day_start_col:
                     day = col - day_start_col + 1
@@ -370,15 +520,15 @@ def workbook_to_html(wb: Workbook, month: str) -> str:
                                 f'{_html_escape(holidays[day])}</span>'
                             )
                     else:
-                        val_str = _format_cell_value(value)
+                        val_str = _format_cell_value(value, computed_value)
                 elif row == weekday_row and day_start_col and col >= day_start_col:
                     day = col - day_start_col + 1
                     if 1 <= day <= days_in_month:
                         val_str = WEEKDAY_CH[date(year, month_num, day).weekday()]
                     else:
-                        val_str = _format_cell_value(value)
+                        val_str = _format_cell_value(value, computed_value)
                 else:
-                    val_str = _format_cell_value(value)
+                    val_str = _format_cell_value(value, computed_value)
 
                 attrs = ""
                 if (row, col) in merged_map:
@@ -531,7 +681,11 @@ def run(
             "error": "template_not_found",
         }
 
+    # Load workbook twice:
+    #   - data_only=False  → styles, formulas, merged cells, structure
+    #   - data_only=True   → cached formula values (computed by Excel)
     wb = load_workbook(str(excel_path), data_only=False, keep_links=False)
+    wb_values = load_workbook(str(excel_path), data_only=True, keep_links=False)
 
     context = {
         "project_id": project_id,
@@ -540,10 +694,23 @@ def run(
     }
 
     _process_workbook(wb, context)
-    html = workbook_to_html(wb, effective_month)
+
+    # Keep wb_values' column structure in sync with wb so that cell
+    # coordinates line up when we read computed values in workbook_to_html.
+    year, month_num = int(effective_month[:4]), int(effective_month[5:7])
+    days_in_month = calendar.monthrange(year, month_num)[1]
+    for vws in wb_values.worksheets:
+        if vws.title == "Data":
+            continue
+        _adjust_day_columns(vws, days_in_month)
+        _update_dates(vws, effective_month)
+
+    html = workbook_to_html(wb, effective_month, value_wb=wb_values)
 
     return {
         "html": html,
         "month": effective_month,
         "template_path": str(rel_path) if rel_path else "",
+        "_wb": wb,           # internal: processed workbook for testing
+        "_wb_values": wb_values,  # internal: value workbook for testing
     }
